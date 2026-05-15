@@ -27,6 +27,10 @@ const (
 	defaultSendDelayLow         = 2 * time.Millisecond
 	defaultSendDelayMax         = 12 * time.Millisecond
 	defaultTelemetryInterval    = 20 * time.Second
+	backpressureBufferThreshold = 512 * 1024
+	backpressureHighBuffer      = 2 * 1024 * 1024
+	backpressureQueueWarn       = 3000
+	backpressureLogInterval     = 5 * time.Second
 
 	keyUID          = "uid"
 	keyDescription  = "description"
@@ -61,42 +65,43 @@ type TrafficShape struct {
 
 // Peer represents a Yandex Telemost WebRTC connection.
 type Peer struct {
-	roomURL         string
-	name            string
-	conn            *ConnectionInfo
-	ws              *websocket.Conn
-	wsMu            sync.Mutex
-	pcSub           *webrtc.PeerConnection
-	pcPub           *webrtc.PeerConnection
-	dc              *webrtc.DataChannel
-	onData          func([]byte)
-	onReconnect     func(*webrtc.DataChannel)
-	shouldReconnect func() bool
-	reconnectCh     chan struct{}
-	closeCh         chan struct{}
-	keepAliveCh     chan struct{}
-	telemetryCh     chan struct{}
-	lastReconnect   time.Time
-	reconnectCount  int
-	sessionMu       sync.Mutex
-	sendQueue       chan []byte
-	sendQueueClosed atomic.Bool
-	closed          atomic.Bool
-	reconnecting    atomic.Bool
-	telemetryActive atomic.Bool
-	ackMu           sync.Mutex
-	ackWaiters      map[string]chan struct{}
-	onEnded         func(string)
-	trafficShape    TrafficShape
-	sessionCloseCh  chan struct{}
-	videoTrackMu    sync.RWMutex
-	videoTracks     []webrtc.TrackLocal
-	onVideoTrack    func(*webrtc.TrackRemote, *webrtc.RTPReceiver)
-	subscriberReady atomic.Bool
-	publisherReady  atomic.Bool
-	subscriberConn  chan struct{}
-	publisherConn   chan struct{}
-	wg              sync.WaitGroup
+	roomURL             string
+	name                string
+	conn                *ConnectionInfo
+	ws                  *websocket.Conn
+	wsMu                sync.Mutex
+	pcSub               *webrtc.PeerConnection
+	pcPub               *webrtc.PeerConnection
+	dc                  *webrtc.DataChannel
+	onData              func([]byte)
+	onReconnect         func(*webrtc.DataChannel)
+	shouldReconnect     func() bool
+	reconnectCh         chan struct{}
+	closeCh             chan struct{}
+	keepAliveCh         chan struct{}
+	telemetryCh         chan struct{}
+	lastReconnect       time.Time
+	reconnectCount      int
+	sessionMu           sync.Mutex
+	sendQueue           chan []byte
+	sendQueueClosed     atomic.Bool
+	closed              atomic.Bool
+	reconnecting        atomic.Bool
+	telemetryActive     atomic.Bool
+	ackMu               sync.Mutex
+	ackWaiters          map[string]chan struct{}
+	onEnded             func(string)
+	trafficShape        TrafficShape
+	sessionCloseCh      chan struct{}
+	videoTrackMu        sync.RWMutex
+	videoTracks         []webrtc.TrackLocal
+	onVideoTrack        func(*webrtc.TrackRemote, *webrtc.RTPReceiver)
+	subscriberReady     atomic.Bool
+	publisherReady      atomic.Bool
+	lastBackpressureLog atomic.Int64
+	subscriberConn      chan struct{}
+	publisherConn       chan struct{}
+	wg                  sync.WaitGroup
 }
 
 // GetSendQueue returns the transmission queue.
@@ -384,7 +389,12 @@ func (p *Peer) onPublisherConnectionStateChange(state webrtc.PeerConnectionState
 }
 
 func (p *Peer) setupDataChannelHandlers(dcReady chan struct{}, sessionCloseCh chan struct{}) {
+	p.dc.SetBufferedAmountLowThreshold(backpressureBufferThreshold)
+	p.dc.OnBufferedAmountLow(func() {
+		logger.Debugf("telemost datachannel buffer low buffered=%d queue=%d", p.GetBufferedAmount(), len(p.sendQueue))
+	})
 	p.dc.OnOpen(func() {
+		logger.Infof("telemost datachannel open label=%s buffered=%d queue=%d", p.dc.Label(), p.GetBufferedAmount(), len(p.sendQueue))
 		numWorkers := 4
 		for i := range numWorkers {
 			p.wg.Add(1)
@@ -396,10 +406,15 @@ func (p *Peer) setupDataChannelHandlers(dcReady chan struct{}, sessionCloseCh ch
 		close(dcReady)
 	})
 
+	p.dc.OnError(func(err error) {
+		logger.Debugf("telemost datachannel error state=%s buffered=%d queue=%d err=%v", p.dc.ReadyState().String(), p.GetBufferedAmount(), len(p.sendQueue), err)
+		p.queueReconnect()
+	})
 	p.dc.OnClose(p.onDataChannelClose)
 	p.dc.OnMessage(p.onDataChannelMessage)
 
 	p.pcSub.OnDataChannel(func(dc *webrtc.DataChannel) {
+		logger.Infof("telemost subscriber datachannel label=%s state=%s", dc.Label(), dc.ReadyState().String())
 		if p.onData != nil {
 			dc.OnMessage(p.onDataChannelMessage)
 		}
@@ -407,6 +422,7 @@ func (p *Peer) setupDataChannelHandlers(dcReady chan struct{}, sessionCloseCh ch
 }
 
 func (p *Peer) onDataChannelClose() {
+	logger.Debugf("telemost datachannel close buffered=%d queue=%d closed=%t", p.GetBufferedAmount(), len(p.sendQueue), p.closed.Load())
 	if !p.closed.Load() {
 		p.queueReconnect()
 	}
@@ -468,8 +484,14 @@ func (p *Peer) Send(data []byte) error {
 
 	select {
 	case p.sendQueue <- data:
+		queueLen := len(p.sendQueue)
+		buffered := p.GetBufferedAmount()
+		if queueLen >= backpressureQueueWarn || buffered >= backpressureHighBuffer {
+			p.logBackpressure("send-queued-high-water", -1, len(data), queueLen, buffered, 0)
+		}
 		return nil
 	case <-time.After(50 * time.Millisecond):
+		p.logBackpressure("send-queue-timeout", -1, len(data), len(p.sendQueue), p.GetBufferedAmount(), 50*time.Millisecond)
 		return ErrSendQueueTimeout
 	}
 }
@@ -1425,7 +1447,7 @@ func (p *Peer) processSendQueue(workerID int, sessionCloseCh <-chan struct{}) {
 				return
 			}
 			if waited > 0 {
-				logger.Verbosef("[WORKER-%d] Drained after %v", workerID, waited)
+				p.logBackpressure("datachannel-buffer-drained", workerID, len(data), len(p.sendQueue), p.GetBufferedAmount(), waited)
 			}
 
 			if err := p.dc.Send(data); err != nil {
@@ -1443,20 +1465,50 @@ func (p *Peer) processSendQueue(workerID int, sessionCloseCh <-chan struct{}) {
 
 func (p *Peer) waitBufferedAmount(workerID int, sessionCloseCh <-chan struct{}) (time.Duration, error) {
 	start := time.Now()
-	for p.dc.BufferedAmount() > 512*1024 {
+	for p.dc.BufferedAmount() > backpressureBufferThreshold {
 		select {
 		case <-sessionCloseCh:
 			return 0, ErrSessionClosed
 		case <-p.closeCh:
 			return 0, ErrPeerClosed
 		case <-time.After(10 * time.Millisecond):
-			if time.Since(start) > 5*time.Second {
-				logger.Debugf("buffer wait timeout worker=%d", workerID)
-				return time.Since(start), nil
+			waited := time.Since(start)
+			buffered := p.dc.BufferedAmount()
+			if buffered >= backpressureHighBuffer || waited > time.Second {
+				p.logBackpressure("datachannel-buffer-wait", workerID, 0, len(p.sendQueue), buffered, waited)
+			}
+			if waited > 5*time.Second {
+				p.logBackpressure("datachannel-buffer-wait-timeout", workerID, 0, len(p.sendQueue), buffered, waited)
+				return waited, nil
 			}
 		}
 	}
 	return time.Since(start), nil
+}
+
+func (p *Peer) logBackpressure(reason string, workerID int, dataLen int, queueLen int, buffered uint64, waited time.Duration) {
+	now := time.Now()
+	last := time.Unix(0, p.lastBackpressureLog.Load())
+	if !last.IsZero() && now.Sub(last) < backpressureLogInterval {
+		return
+	}
+	if !p.lastBackpressureLog.CompareAndSwap(last.UnixNano(), now.UnixNano()) {
+		return
+	}
+	state := "nil"
+	if p.dc != nil {
+		state = p.dc.ReadyState().String()
+	}
+	logger.Debugf(
+		"telemost backpressure reason=%s worker=%d data=%d queue=%d buffered=%d waited=%v dc_state=%s",
+		reason,
+		workerID,
+		dataLen,
+		queueLen,
+		buffered,
+		waited,
+		state,
+	)
 }
 
 func (p *Peer) calculateDelay() time.Duration {
