@@ -44,15 +44,17 @@ var (
 
 // Client handles local SOCKS5 connections and tunnels them to the server.
 type Client struct {
-	ln        link.Link
-	cipher    *crypto.Cipher
-	conn      *muxconn.Conn
-	session   *smux.Session
-	sessMu    sync.RWMutex
-	clientID  string
-	dnsServer string
-	socksUser string
-	socksPass string
+	ln          link.Link
+	cipher      *crypto.Cipher
+	conn        *muxconn.Conn
+	session     *smux.Session
+	sessMu          sync.RWMutex
+	reconnectMu     sync.Mutex
+	lastReconnectAt time.Time
+	clientID        string
+	dnsServer   string
+	socksUser   string
+	socksPass   string
 }
 
 // Run starts the client with the specified parameters.
@@ -251,7 +253,17 @@ func smuxConfig() *smux.Config {
 }
 
 func (c *Client) handleReconnect() {
-	logger.Infof("client link reconnect - tearing down smux session")
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
+	now := time.Now()
+	if !c.lastReconnectAt.IsZero() && now.Sub(c.lastReconnectAt) < 2*time.Second {
+		logger.Debugf("client link reconnect ignored - debounce window")
+		return
+	}
+	c.lastReconnectAt = now
+
+	logger.Infof("client link reconnect - reinstalling smux session")
 	c.sessMu.Lock()
 	if c.session != nil {
 		_ = c.session.Close()

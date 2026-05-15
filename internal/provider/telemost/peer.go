@@ -1322,10 +1322,6 @@ func (p *Peer) reconnect(ctx context.Context) error {
 		p.wsMu.Unlock()
 	}
 
-	if p.onReconnect != nil {
-		p.onReconnect(nil)
-	}
-
 	time.Sleep(3 * time.Second)
 	conn, err := GetConnectionInfo(ctx, p.roomURL, p.name)
 	if err != nil {

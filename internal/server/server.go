@@ -40,10 +40,12 @@ type Server struct {
 	cipher         *crypto.Cipher
 	conn           *muxconn.Conn
 	session        *smux.Session
-	sessMu         sync.RWMutex
-	reinstallMu    sync.Mutex
-	wg             sync.WaitGroup
-	clientID       string
+	sessMu          sync.RWMutex
+	reinstallMu     sync.Mutex
+	reconnectMu     sync.Mutex
+	lastReconnectAt time.Time
+	wg              sync.WaitGroup
+	clientID        string
 	dnsServer      string
 	resolver       *net.Resolver
 	socksProxyAddr string
@@ -252,7 +254,17 @@ func (s *Server) installSession() {
 }
 
 func (s *Server) handleReconnect() {
-	logger.Infof("server link reconnect - tearing down smux session")
+	s.reconnectMu.Lock()
+	defer s.reconnectMu.Unlock()
+
+	now := time.Now()
+	if !s.lastReconnectAt.IsZero() && now.Sub(s.lastReconnectAt) < 2*time.Second {
+		logger.Debugf("server link reconnect ignored - debounce window")
+		return
+	}
+	s.lastReconnectAt = now
+
+	logger.Infof("server link reconnect - reinstalling smux session")
 	s.sessMu.RLock()
 	current := s.session
 	s.sessMu.RUnlock()
