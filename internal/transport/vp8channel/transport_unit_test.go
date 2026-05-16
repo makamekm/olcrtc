@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/carrier"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -24,19 +23,25 @@ type fakeVideoSession struct {
 	err    error
 }
 
-func TestSampleIntervalWithBatch(t *testing.T) {
+func TestCollectOutboundBatch(t *testing.T) {
 	tr := &streamTransport{
-		frameInterval: time.Second / 60,
-		batchSize:     64,
+		batchSize: 3,
+		outbound:  make(chan []byte, 4),
 	}
-	want := time.Second / 60 / 64
-	if got := tr.sampleInterval(); got != want {
-		t.Fatalf("sampleInterval() = %v, want %v", got, want)
-	}
+	tr.outbound <- []byte("one")
+	tr.outbound <- []byte("two")
+	tr.outbound <- []byte("three")
+	tr.outbound <- []byte("four")
 
-	tr.batchSize = 1
-	if got := tr.sampleInterval(); got != tr.frameInterval {
-		t.Fatalf("sampleInterval(batch=1) = %v, want %v", got, tr.frameInterval)
+	batch := tr.collectOutboundBatch()
+	if len(batch) != 3 {
+		t.Fatalf("collectOutboundBatch() len = %d, want 3", len(batch))
+	}
+	if string(batch[0]) != "one" || string(batch[2]) != "three" {
+		t.Fatalf("collectOutboundBatch() = %q", batch)
+	}
+	if left := len(tr.outbound); left != 1 {
+		t.Fatalf("outbound left = %d, want 1", left)
 	}
 }
 
@@ -191,6 +196,9 @@ func TestEpochHeaderTokenAndOutboundCapacity(t *testing.T) {
 	}
 	if bindingToken("") == 0 || randomEpoch() == 0 {
 		t.Fatal("bindingToken/randomEpoch returned zero")
+	}
+	if bindingToken("srv-android-01") != bindingToken("android-01") {
+		t.Fatal("server participant prefix must not change VP8 binding token")
 	}
 
 	rt, err := startKCP(tr.outbound, nil, tr.epochHeader())

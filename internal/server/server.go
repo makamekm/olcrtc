@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -165,7 +166,7 @@ func smuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
 	cfg.KeepAliveDisabled = true
-	cfg.MaxFrameSize = 32768
+	cfg.MaxFrameSize = 8192
 	cfg.MaxReceiveBuffer = 16 * 1024 * 1024
 	cfg.MaxStreamBuffer = 1024 * 1024
 	cfg.KeepAliveInterval = 10 * time.Second
@@ -409,7 +410,11 @@ func parseConnectRequest(buf []byte) (ConnectRequest, bool) {
 }
 
 func (s *Server) authorizeRequest(req ConnectRequest) bool {
-	return req.ClientID == s.clientID
+	return req.ClientID == serverClientIdentity(s.clientID)
+}
+
+func serverClientIdentity(clientID string) string {
+	return strings.TrimPrefix(clientID, "srv-")
 }
 
 func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {

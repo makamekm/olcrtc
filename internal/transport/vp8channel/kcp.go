@@ -23,9 +23,13 @@ const kcpConvID = 0xC0FFEE01
 // KCP tuning targets a lossy, bursty carrier (VP8 over an SFU). The defaults
 // are TCP-like and recover slowly after burst losses.
 const (
-	// kcp-go hardcodes mtuLimit=1500, so SetMtu() above this is silently
-	// clamped. Stay below that with headroom for KCP overhead (24 bytes).
-	kcpMTU = 1400
+	// Keep KCP packets small enough to fit into one RTP payload after the
+	// vp8channel epoch header. A 1400-byte KCP MTU makes Pion fragment a
+	// single VP8 sample into multiple RTP packets; Telemost may reorder/drop
+	// one fragment, causing the whole VP8 frame to be discarded and KCP to
+	// stall in retransmits. 1000 keeps the sample below common RTP payload
+	// limits with enough headroom for VP8/RTP framing.
+	kcpMTU = 1000
 
 	// Receive/send window in segments. Large window allows in-flight bursts
 	// without stalling - important when one VP8 frame may carry many KCP

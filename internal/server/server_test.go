@@ -40,7 +40,7 @@ func TestSetupCipherRejectsBadInput(t *testing.T) {
 
 func TestSmuxConfig(t *testing.T) {
 	cfg := smuxConfig()
-	if cfg.Version != 2 || !cfg.KeepAliveDisabled || cfg.MaxFrameSize != 32768 || cfg.MaxReceiveBuffer != 16*1024*1024 {
+	if cfg.Version != 2 || !cfg.KeepAliveDisabled || cfg.MaxFrameSize != 8192 || cfg.MaxReceiveBuffer != 16*1024*1024 {
 		t.Fatalf("smuxConfig() = %+v", cfg)
 	}
 }
@@ -79,6 +79,11 @@ func TestAuthorizeRequest(t *testing.T) {
 	}
 	if s.authorizeRequest(ConnectRequest{ClientID: "client-2"}) {
 		t.Fatal("authorizeRequest() accepted wrong client")
+	}
+
+	s = &Server{clientID: "srv-android-01"}
+	if !s.authorizeRequest(ConnectRequest{ClientID: "android-01"}) {
+		t.Fatal("authorizeRequest() rejected split server/device identity")
 	}
 }
 

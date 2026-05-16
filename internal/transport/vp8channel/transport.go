@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,7 +47,7 @@ import (
 )
 
 const (
-	defaultMaxPayloadSize = 60 * 1024
+	defaultMaxPayloadSize = 8 * 1024
 	defaultConnectTimeout = 60 * time.Second
 	rtpBufSize            = 65536
 	outboundQueueSize     = 1024
@@ -81,6 +82,7 @@ const (
 	tokenOff    = 20
 	epochOff    = 24
 	epochHdrLen = 28
+	batchMagic  = 0x4f4c4342 // OLCB
 )
 
 type streamTransport struct {
@@ -96,6 +98,11 @@ type streamTransport struct {
 	kcpOnce       sync.Once
 	frameInterval time.Duration
 	batchSize     int
+	outFrames     atomic.Uint64
+	outBytes      atomic.Uint64
+	inFrames      atomic.Uint64
+	inBytes       atomic.Uint64
+	lastStats     atomic.Int64
 
 	// localEpoch is bumped on every KCP session restart and stamped into
 	// every outgoing VP8 frame. peerEpoch tracks the last epoch we observed
@@ -198,8 +205,9 @@ func (p *streamTransport) epochHeader() [epochHdrLen]byte {
 }
 
 func bindingToken(clientID string) uint32 {
+	identity := strings.TrimPrefix(clientID, "srv-")
 	h := fnv.New32a()
-	_, _ = h.Write([]byte(clientID))
+	_, _ = h.Write([]byte(identity))
 	token := h.Sum32()
 	if token == 0 {
 		token = 1
@@ -317,12 +325,10 @@ func (p *streamTransport) Features() transport.Features {
 func (p *streamTransport) writerLoop() {
 	defer close(p.writerDone)
 
-	sampleInterval := p.sampleInterval()
-
-	ticker := time.NewTicker(sampleInterval)
+	ticker := time.NewTicker(p.frameInterval)
 	defer ticker.Stop()
 
-	keepaliveEvery := max(int(keepaliveIdlePeriod/sampleInterval), 1)
+	keepaliveEvery := max(int(keepaliveIdlePeriod/p.frameInterval), 1)
 	idleTicks := 0
 
 	for {
@@ -330,34 +336,91 @@ func (p *streamTransport) writerLoop() {
 		case <-p.closeCh:
 			return
 		case <-ticker.C:
-			var sample []byte
-			select {
-			case frame := <-p.outbound:
-				sample = frame
-				idleTicks = 0
-			default:
+			frames := p.collectOutboundBatch()
+			if len(frames) == 0 {
 				idleTicks++
 				if idleTicks < keepaliveEvery {
 					continue
 				}
 				idleTicks = 0
 				hdr := p.epochHeader()
-				sample = hdr[:]
+				frames = [][]byte{hdr[:]}
+			} else {
+				idleTicks = 0
 			}
 
-			_ = p.track.WriteSample(media.Sample{
+			sample := p.buildSample(frames)
+			if err := p.track.WriteSample(media.Sample{
 				Data:     sample,
-				Duration: sampleInterval,
-			})
+				Duration: p.frameInterval,
+			}); err != nil {
+				logger.Infof("vp8channel: WriteSample failed: %v", err)
+				continue
+			}
+			p.outFrames.Add(1)
+			p.outBytes.Add(uint64(len(sample)))
+			p.maybeLogStats()
 		}
 	}
 }
 
-func (p *streamTransport) sampleInterval() time.Duration {
-	if p.batchSize > 1 {
-		return p.frameInterval / time.Duration(p.batchSize)
+func (p *streamTransport) maybeLogStats() {
+	now := time.Now().Unix()
+	prev := p.lastStats.Load()
+	if now-prev < 10 || !p.lastStats.CompareAndSwap(prev, now) {
+		return
 	}
-	return p.frameInterval
+	logger.Infof(
+		"vp8channel stats: out_frames=%d out_bytes=%d in_frames=%d in_bytes=%d outbound_queue=%d/%d",
+		p.outFrames.Load(),
+		p.outBytes.Load(),
+		p.inFrames.Load(),
+		p.inBytes.Load(),
+		len(p.outbound),
+		cap(p.outbound),
+	)
+}
+
+func (p *streamTransport) collectOutboundBatch() [][]byte {
+	limit := p.batchSize
+	if limit < 1 {
+		limit = 1
+	}
+	frames := make([][]byte, 0, limit)
+	for len(frames) < limit {
+		select {
+		case frame := <-p.outbound:
+			frames = append(frames, frame)
+		default:
+			return frames
+		}
+	}
+	return frames
+}
+
+func (p *streamTransport) buildSample(frames [][]byte) []byte {
+	if len(frames) == 1 {
+		return frames[0]
+	}
+	total := epochHdrLen + 6
+	for _, frame := range frames {
+		total += 2 + len(frame[epochHdrLen:])
+	}
+	sample := make([]byte, 0, total)
+	hdr := p.epochHeader()
+	sample = append(sample, hdr[:]...)
+	var scratch [6]byte
+	binary.BigEndian.PutUint32(scratch[0:4], batchMagic)
+	binary.BigEndian.PutUint16(scratch[4:6], uint16(len(frames))) //nolint:gosec // bounded by batchSize
+	sample = append(sample, scratch[:]...)
+	for _, frame := range frames {
+		payload := frame[epochHdrLen:]
+		var lenBuf [2]byte
+		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(payload))) //nolint:gosec // KCP MTU keeps payload small
+		sample = append(sample, lenBuf[:]...)
+		sample = append(sample, payload...)
+	}
+	return sample
 }
 
 func (p *streamTransport) resetKCP() {
@@ -541,11 +604,39 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	if len(kcpPayload) == 0 {
 		return
 	}
+	if len(kcpPayload) >= 6 && binary.BigEndian.Uint32(kcpPayload[0:4]) == batchMagic {
+		p.handleIncomingBatch(kcpPayload)
+		return
+	}
+	p.deliverKCPPacket(kcpPayload)
+}
+
+func (p *streamTransport) handleIncomingBatch(payload []byte) {
+	count := int(binary.BigEndian.Uint16(payload[4:6]))
+	off := 6
+	for i := 0; i < count; i++ {
+		if off+2 > len(payload) {
+			return
+		}
+		n := int(binary.BigEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if n <= 0 || off+n > len(payload) {
+			return
+		}
+		p.deliverKCPPacket(payload[off : off+n])
+		off += n
+	}
+}
+
+func (p *streamTransport) deliverKCPPacket(packet []byte) {
+	p.inFrames.Add(1)
+	p.inBytes.Add(uint64(len(packet)))
+	p.maybeLogStats()
 	p.kcpMu.RLock()
 	rt := p.kcp
 	p.kcpMu.RUnlock()
 	if rt != nil {
-		rt.deliver(kcpPayload)
+		rt.deliver(packet)
 	}
 }
 
