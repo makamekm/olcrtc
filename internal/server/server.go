@@ -37,20 +37,20 @@ var (
 
 // Server handles incoming tunnel connections and proxies their traffic.
 type Server struct {
-	ln             link.Link
-	cipher         *crypto.Cipher
-	conn           *muxconn.Conn
-	session        *smux.Session
+	ln              link.Link
+	cipher          *crypto.Cipher
+	conn            *muxconn.Conn
+	session         *smux.Session
 	sessMu          sync.RWMutex
 	reinstallMu     sync.Mutex
 	reconnectMu     sync.Mutex
 	lastReconnectAt time.Time
 	wg              sync.WaitGroup
 	clientID        string
-	dnsServer      string
-	resolver       *net.Resolver
-	socksProxyAddr string
-	socksProxyPort int
+	dnsServer       string
+	resolver        *net.Resolver
+	socksProxyAddr  string
+	socksProxyPort  int
 }
 
 // ConnectRequest is a message from the client to establish a new connection.
@@ -439,7 +439,7 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
 
 	go func() {
 		_, _ = io.Copy(stream, conn)
-		_ = stream.Close()
+		_ = stream.CloseWrite()
 	}()
 	_, _ = io.Copy(conn, stream)
 }

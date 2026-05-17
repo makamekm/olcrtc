@@ -44,17 +44,17 @@ var (
 
 // Client handles local SOCKS5 connections and tunnels them to the server.
 type Client struct {
-	ln          link.Link
-	cipher      *crypto.Cipher
-	conn        *muxconn.Conn
-	session     *smux.Session
+	ln              link.Link
+	cipher          *crypto.Cipher
+	conn            *muxconn.Conn
+	session         *smux.Session
 	sessMu          sync.RWMutex
 	reconnectMu     sync.Mutex
 	lastReconnectAt time.Time
 	clientID        string
-	dnsServer   string
-	socksUser   string
-	socksPass   string
+	dnsServer       string
+	socksUser       string
+	socksPass       string
 }
 
 // Run starts the client with the specified parameters.
@@ -386,7 +386,7 @@ func (c *Client) tunnel(conn net.Conn, sess *smux.Session, targetAddr string, ta
 
 	go func() {
 		_, _ = io.Copy(stream, conn)
-		_ = stream.Close()
+		_ = stream.CloseWrite()
 	}()
 	_, _ = io.Copy(conn, stream)
 }

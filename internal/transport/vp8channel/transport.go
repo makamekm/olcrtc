@@ -86,23 +86,26 @@ const (
 )
 
 type streamTransport struct {
-	stream        carrier.VideoTrack
-	track         *webrtc.TrackLocalStaticSample
-	onData        func([]byte)
-	outbound      chan []byte
-	closeCh       chan struct{}
-	writerDone    chan struct{}
-	closed        atomic.Bool
-	writerUp      atomic.Bool
-	writerOnce    sync.Once
-	kcpOnce       sync.Once
-	frameInterval time.Duration
-	batchSize     int
-	outFrames     atomic.Uint64
-	outBytes      atomic.Uint64
-	inFrames      atomic.Uint64
-	inBytes       atomic.Uint64
-	lastStats     atomic.Int64
+	stream         carrier.VideoTrack
+	track          *webrtc.TrackLocalStaticSample
+	onData         func([]byte)
+	outbound       chan []byte
+	closeCh        chan struct{}
+	writerDone     chan struct{}
+	closed         atomic.Bool
+	writerUp       atomic.Bool
+	writerOnce     sync.Once
+	kcpOnce        sync.Once
+	frameInterval  time.Duration
+	batchSize      int
+	outFrames      atomic.Uint64
+	outBytes       atomic.Uint64
+	inFrames       atomic.Uint64
+	inBytes        atomic.Uint64
+	lastStats      atomic.Int64
+	lastEpochReset atomic.Int64
+	firstPeerAt    atomic.Int64
+	activeTrackID  atomic.Uint64
 
 	// localEpoch is bumped on every KCP session restart and stamped into
 	// every outgoing VP8 frame. peerEpoch tracks the last epoch we observed
@@ -452,10 +455,11 @@ func (p *streamTransport) handleRemoteTrack(track *webrtc.TrackRemote, _ *webrtc
 		return
 	}
 
-	// We don't reset KCP here. Peer restarts are detected by the epoch
-	// header on incoming frames, which works even when the SFU keeps
-	// forwarding the same track across our restarts.
-	go p.readVP8Track(track)
+	// Telemost can keep stale VP8 tracks alive for a few seconds when the same
+	// participant identity reconnects. Consume all tracks, but deliver frames
+	// only from the newest track to avoid feeding old epochs into KCP.
+	trackID := p.activeTrackID.Add(1)
+	go p.readVP8Track(track, trackID)
 }
 
 func (p *streamTransport) drainTrack(track *webrtc.TrackRemote) {
@@ -521,7 +525,7 @@ func (s *vp8FrameState) processRTPPacket(pkt *rtp.Packet) []byte {
 	return nil
 }
 
-func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
+func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote, trackID uint64) {
 	var state vp8FrameState
 	buf := make([]byte, rtpBufSize)
 
@@ -540,6 +544,9 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 		if frame == nil {
 			continue
 		}
+		if p.activeTrackID.Load() != trackID {
+			continue
+		}
 
 		p.handleIncomingFrame(frame)
 	}
@@ -547,6 +554,7 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 
 func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
 	p.peerEpoch.Store(peerEpoch)
+	p.firstPeerAt.Store(time.Now().UnixNano())
 	logger.Infof("vp8channel: peer first seen epoch=0x%08x", peerEpoch)
 	p.kcpOnce.Do(func() {
 		rt, err := startKCP(p.outbound, p.onData, p.epochHeader())
@@ -585,20 +593,46 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	if !p.hadPeer.Swap(true) {
 		p.handleFirstPeer(peerEpoch)
 	} else if prev := p.peerEpoch.Load(); prev != peerEpoch {
-		// Peer restarted its KCP session. Reset ours so the conv state
-		// machines re-converge. CAS guards against double-reset when
-		// fragmented frames straddle the epoch boundary.
-		if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
-			p.resetKCP()
-			p.reconnectMu.Lock()
-			fn := p.reconnectFn
-			p.reconnectMu.Unlock()
-			if fn != nil {
-				fn()
+		// Telemost/SFU can briefly forward a stale VP8 track when a participant
+		// with the same identity reconnects. During the initial convergence
+		// window we adopt the newest epoch without resetting KCP; otherwise the
+		// first HTTP stream is torn down before smux has a chance to settle.
+		now := time.Now().UnixNano()
+		if first := p.firstPeerAt.Load(); first != 0 && time.Duration(now-first) < 10*time.Second {
+			if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
+				logger.Infof(
+					"vp8channel: peer epoch switched during initial grace prev=0x%08x next=0x%08x - no KCP reset",
+					prev,
+					peerEpoch,
+				)
 			}
+		} else {
+			// Peer restarted its KCP session. Reset ours so the conv state
+			// machines re-converge. CAS guards against double-reset when
+			// fragmented frames straddle the epoch boundary.
+			last := p.lastEpochReset.Load()
+			if last != 0 && time.Duration(now-last) < 45*time.Second {
+				logger.Debugf(
+					"vp8channel: peer epoch change suppressed prev=0x%08x next=0x%08x",
+					prev,
+					peerEpoch,
+				)
+				return
+			}
+			if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
+				p.lastEpochReset.Store(now)
+				logger.Infof("vp8channel: peer epoch changed prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
+				p.resetKCP()
+				p.reconnectMu.Lock()
+				fn := p.reconnectFn
+				p.reconnectMu.Unlock()
+				if fn != nil {
+					fn()
+				}
+			}
+			// Drop this packet: it predates our fresh KCP session.
+			return
 		}
-		// Drop this packet: it predates our fresh KCP session.
-		return
 	}
 
 	if len(kcpPayload) == 0 {

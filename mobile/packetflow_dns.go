@@ -24,6 +24,9 @@ func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 		resp, ok := buildDNSResponseViaTCP(packetCopy, rw.socksHost, rw.socksPort)
 		if !ok || len(resp) == 0 {
 			atomic.AddUint64(&rw.dnsMiss, 1)
+			if failure, built := buildDNSFailureResponse(packetCopy); built {
+				_ = rw.Respond(failure)
+			}
 			return
 		}
 		atomic.AddUint64(&rw.dnsAnswered, 1)
@@ -103,6 +106,45 @@ func buildDNSResponseViaTCP(packet []byte, socksHost string, socksPort int) ([]b
 }
 
 func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int) ([]byte, error) {
+	if cached, ok := getCachedDNSAnswer(query); ok {
+		return cached, nil
+	}
+	var lastErr error
+	answer, err := resolveDNSOverTCPDirect(query, packetFlowDNSServer)
+	if err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer) {
+		putCachedDNSAnswer(query, answer)
+		return answer, nil
+	}
+	lastErr = err
+	if err == nil && isRetryableDNSResponse(answer) {
+		lastErr = errors.New("retryable dns response from direct resolver")
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		answer, err = resolveDNSOverTCPViaSocksOnce(query, socksHost, socksPort)
+		if err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer) {
+			putCachedDNSAnswer(query, answer)
+			return answer, nil
+		}
+		lastErr = err
+		if err == nil && isRetryableDNSResponse(answer) {
+			lastErr = errors.New("retryable dns response from socks resolver")
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("empty dns answer")
+	}
+	return nil, lastErr
+}
+
+func isRetryableDNSResponse(answer []byte) bool {
+	if len(answer) < 4 {
+		return false
+	}
+	rcode := answer[3] & 0x0f
+	return rcode == 2 || rcode == 5 // SERVFAIL/REFUSED: retry via carrier, never cache.
+}
+
+func resolveDNSOverTCPViaSocksOnce(query []byte, socksHost string, socksPort int) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -130,7 +172,7 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int) ([
 		return nil, err
 	}
 	answerLen := int(binary.BigEndian.Uint16(length[:]))
-	if answerLen <= 0 || answerLen > 4096 {
+	if answerLen <= 0 || answerLen > 65535 {
 		return nil, fmt.Errorf("invalid dns answer length: %d", answerLen)
 	}
 	answer := make([]byte, answerLen)

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/carrier"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -324,8 +325,13 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 		t.Fatalf("stream reconnect did not reset/callback: reconnected=%v kcp=%v", reconnected, tr.kcp)
 	}
 	reconnected = false
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 2, []byte("after-restart")))
-	if !reconnected || tr.peerEpoch.Load() != 2 || tr.kcp == nil {
-		t.Fatalf("epoch change did not reset/reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 2, []byte("initial-switch")))
+	if reconnected || tr.peerEpoch.Load() != 2 {
+		t.Fatalf("initial epoch switch should adopt without reconnect: reconnected=%v epoch=%d", reconnected, tr.peerEpoch.Load()) //nolint:lll // long test description
+	}
+	tr.firstPeerAt.Store(time.Now().Add(-11 * time.Second).UnixNano())
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 3, []byte("after-restart")))
+	if !reconnected || tr.peerEpoch.Load() != 3 || tr.kcp == nil {
+		t.Fatalf("epoch change after grace did not reset/reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
 	}
 }
