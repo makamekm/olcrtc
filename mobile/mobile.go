@@ -65,14 +65,15 @@ const (
 )
 
 var (
-	mu                 sync.Mutex //nolint:gochecknoglobals // package-level state intentional
-	defaults           mobileConfig //nolint:gochecknoglobals // package-level state intentional
-	defaultsSet        sync.Once //nolint:gochecknoglobals // package-level state intentional
-	registerSet        sync.Once //nolint:gochecknoglobals // package-level state intentional
+	mu                 sync.Mutex            //nolint:gochecknoglobals // package-level state intentional
+	defaults           mobileConfig          //nolint:gochecknoglobals // package-level state intentional
+	defaultsSet        sync.Once             //nolint:gochecknoglobals // package-level state intentional
+	registerSet        sync.Once             //nolint:gochecknoglobals // package-level state intentional
 	runClientWithReady = client.RunWithReady //nolint:gochecknoglobals // package-level state intentional
-	cancel             context.CancelFunc //nolint:gochecknoglobals // package-level state intentional
-	done               chan struct{} //nolint:gochecknoglobals // package-level state intentional
-	ready              chan struct{} //nolint:gochecknoglobals // package-level state intentional
+	cancel             context.CancelFunc    //nolint:gochecknoglobals // package-level state intentional
+	done               chan struct{}         //nolint:gochecknoglobals // package-level state intentional
+	ready              chan struct{}         //nolint:gochecknoglobals // package-level state intentional
+	activeSocksPort    int                   //nolint:gochecknoglobals // package-level state intentional
 	errRun             error
 )
 
@@ -563,6 +564,7 @@ func startWithConfig(
 	cancel = cancelFunc
 	done = make(chan struct{})
 	ready = make(chan struct{})
+	activeSocksPort = socksPort
 	localReady := ready
 	errRun = nil
 
@@ -607,6 +609,7 @@ func startWithConfig(
 
 		mu.Lock()
 		cancel = nil
+		activeSocksPort = 0
 		errRun = err
 		mu.Unlock()
 		close(done)
@@ -616,6 +619,7 @@ func startWithConfig(
 }
 
 // WaitReady blocks until the selected transport is connected and the local SOCKS5 listener is ready.
+//
 //nolint:cyclop // straightforward state-machine waits with multiple terminal conditions
 func WaitReady(timeoutMillis int) error {
 	mu.Lock()
@@ -665,6 +669,36 @@ func WaitReady(timeoutMillis int) error {
 	case <-timer.C:
 		return errStartTimedOut
 	}
+}
+
+// PingActive performs an HTTP request through the currently running singleton SOCKS tunnel.
+// It is intended for mobile liveness checks: unlike Ping, it does not start a second RTC peer.
+func PingActive(timeoutMillis int, pingURL string) (int64, error) {
+	mu.Lock()
+	socksPort := activeSocksPort
+	running := cancel != nil
+	runErr := errRun
+	mu.Unlock()
+
+	if !running || socksPort <= 0 {
+		if runErr != nil {
+			return 0, runErr
+		}
+
+		return 0, errNotRunning
+	}
+
+	if timeoutMillis <= 0 {
+		timeoutMillis = 4000
+	}
+	if pingURL == "" {
+		pingURL = defaultHTTPPingURL
+	}
+
+	ctx, cancelFunc := context.WithTimeout(context.Background(), time.Duration(timeoutMillis)*time.Millisecond)
+	defer cancelFunc()
+
+	return httpPingThroughSocks(ctx, fmt.Sprintf("127.0.0.1:%d", socksPort), pingURL)
 }
 
 // Stop gracefully stops the olcRTC client.

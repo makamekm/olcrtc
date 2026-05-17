@@ -14,6 +14,8 @@ import (
 
 const packetFlowDNSServer = "192.168.0.1:53"
 
+var packetFlowDNSSemaphore = make(chan struct{}, 32)
+
 func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 	if !isIPv4UDP53(packet) {
 		return false
@@ -21,6 +23,21 @@ func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 	atomic.AddUint64(&rw.dnsSeen, 1)
 	packetCopy := append([]byte(nil), packet...)
 	go func() {
+		if resp, ok := buildLocalDNSNoDataResponse(packetCopy); ok {
+			atomic.AddUint64(&rw.dnsAnswered, 1)
+			_ = rw.Respond(resp)
+			return
+		}
+		select {
+		case packetFlowDNSSemaphore <- struct{}{}:
+			defer func() { <-packetFlowDNSSemaphore }()
+		case <-time.After(250 * time.Millisecond):
+			atomic.AddUint64(&rw.dnsMiss, 1)
+			if failure, built := buildDNSFailureResponse(packetCopy); built {
+				_ = rw.Respond(failure)
+			}
+			return
+		}
 		resp, ok := buildDNSResponseViaTCP(packetCopy, rw.socksHost, rw.socksPort)
 		if !ok || len(resp) == 0 {
 			atomic.AddUint64(&rw.dnsMiss, 1)
@@ -109,31 +126,23 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int) ([
 	if cached, ok := getCachedDNSAnswer(query); ok {
 		return cached, nil
 	}
-	var lastErr error
-	answer, err := resolveDNSOverTCPDirect(query, packetFlowDNSServer)
+	answer, err := resolveDNSOverUDPDirect(query, packetFlowDNSServer)
 	if err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer) {
 		putCachedDNSAnswer(query, answer)
 		return answer, nil
 	}
-	lastErr = err
+	answer, err = resolveDNSOverTCPDirect(query, packetFlowDNSServer)
+	if err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer) {
+		putCachedDNSAnswer(query, answer)
+		return answer, nil
+	}
 	if err == nil && isRetryableDNSResponse(answer) {
-		lastErr = errors.New("retryable dns response from direct resolver")
+		err = errors.New("retryable dns response from direct resolver")
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		answer, err = resolveDNSOverTCPViaSocksOnce(query, socksHost, socksPort)
-		if err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer) {
-			putCachedDNSAnswer(query, answer)
-			return answer, nil
-		}
-		lastErr = err
-		if err == nil && isRetryableDNSResponse(answer) {
-			lastErr = errors.New("retryable dns response from socks resolver")
-		}
+	if err == nil {
+		err = errors.New("empty dns answer")
 	}
-	if lastErr == nil {
-		lastErr = errors.New("empty dns answer")
-	}
-	return nil, lastErr
+	return nil, err
 }
 
 func isRetryableDNSResponse(answer []byte) bool {
