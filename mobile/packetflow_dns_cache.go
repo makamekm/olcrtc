@@ -17,6 +17,12 @@ var packetFlowDNSCache = struct {
 	entries map[string]packetFlowDNSCacheEntry
 }{entries: make(map[string]packetFlowDNSCacheEntry)}
 
+func clearPacketFlowDNSCache() {
+	packetFlowDNSCache.mu.Lock()
+	defer packetFlowDNSCache.mu.Unlock()
+	packetFlowDNSCache.entries = make(map[string]packetFlowDNSCacheEntry)
+}
+
 func getCachedDNSAnswer(query []byte) ([]byte, bool) {
 	key, ok := packetFlowDNSCacheKey(query)
 	if !ok {

@@ -36,6 +36,7 @@ func MobileStartPacketFlowTun2Socks(socksHost string, socksPort int64, mtu int64
 	if packetFlowTun2Socks.running {
 		return true, nil
 	}
+	clearPacketFlowDNSCache()
 	if socksHost == "" {
 		socksHost = "127.0.0.1"
 	}
@@ -78,6 +79,7 @@ func MobileStartPacketFlowTun2Socks(socksHost string, socksPort int64, mtu int64
 func MobileStopPacketFlowTun2Socks() {
 	packetFlowTun2Socks.mu.Lock()
 	defer packetFlowTun2Socks.mu.Unlock()
+	clearPacketFlowDNSCache()
 	if packetFlowTun2Socks.rw != nil {
 		packetFlowTun2Socks.rw.Close()
 	}
