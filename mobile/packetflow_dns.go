@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const packetFlowDNSServer = "192.168.0.1:53"
+const (
+	packetFlowDNSServer           = "192.168.0.1:53"
+	packetFlowDNSAcquireTimeout   = 2 * time.Second
+)
 
 var packetFlowDNSSemaphore = make(chan struct{}, 32)
 
@@ -31,7 +34,7 @@ func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 		select {
 		case packetFlowDNSSemaphore <- struct{}{}:
 			defer func() { <-packetFlowDNSSemaphore }()
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(packetFlowDNSAcquireTimeout):
 			atomic.AddUint64(&rw.dnsMiss, 1)
 			if failure, built := buildDNSFailureResponse(packetCopy); built {
 				_ = rw.Respond(failure)
@@ -126,23 +129,39 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int) ([
 	if cached, ok := getCachedDNSAnswer(query); ok {
 		return cached, nil
 	}
-	answer, err := resolveDNSOverUDPDirect(query, packetFlowDNSServer)
-	if err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer) {
+
+	answer, carrierErr := resolveDNSOverTCPViaSocksOnce(query, socksHost, socksPort)
+	if isUsableDNSAnswer(answer, carrierErr) {
 		putCachedDNSAnswer(query, answer)
 		return answer, nil
 	}
-	answer, err = resolveDNSOverTCPDirect(query, packetFlowDNSServer)
-	if err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer) {
+
+	answer, directErr := resolveDNSOverUDPDirect(query, packetFlowDNSServer)
+	if isUsableDNSAnswer(answer, directErr) {
 		putCachedDNSAnswer(query, answer)
 		return answer, nil
 	}
-	if err == nil && isRetryableDNSResponse(answer) {
-		err = errors.New("retryable dns response from direct resolver")
+
+	answer, tcpErr := resolveDNSOverTCPDirect(query, packetFlowDNSServer)
+	if isUsableDNSAnswer(answer, tcpErr) {
+		putCachedDNSAnswer(query, answer)
+		return answer, nil
 	}
-	if err == nil {
-		err = errors.New("empty dns answer")
+
+	if tcpErr != nil {
+		return nil, tcpErr
 	}
-	return nil, err
+	if directErr != nil {
+		return nil, directErr
+	}
+	if carrierErr != nil {
+		return nil, carrierErr
+	}
+	return nil, errors.New("empty or synthetic dns answer")
+}
+
+func isUsableDNSAnswer(answer []byte, err error) bool {
+	return err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer)
 }
 
 func isRetryableDNSResponse(answer []byte) bool {
