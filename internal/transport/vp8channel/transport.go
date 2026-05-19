@@ -86,26 +86,28 @@ const (
 )
 
 type streamTransport struct {
-	stream         carrier.VideoTrack
-	track          *webrtc.TrackLocalStaticSample
-	onData         func([]byte)
-	outbound       chan []byte
-	closeCh        chan struct{}
-	writerDone     chan struct{}
-	closed         atomic.Bool
-	writerUp       atomic.Bool
-	writerOnce     sync.Once
-	kcpOnce        sync.Once
-	frameInterval  time.Duration
-	batchSize      int
-	outFrames      atomic.Uint64
-	outBytes       atomic.Uint64
-	inFrames       atomic.Uint64
-	inBytes        atomic.Uint64
-	lastStats      atomic.Int64
-	lastEpochReset atomic.Int64
-	firstPeerAt    atomic.Int64
-	activeTrackID  atomic.Uint64
+	stream           carrier.VideoTrack
+	track            *webrtc.TrackLocalStaticSample
+	onData           func([]byte)
+	outbound         chan []byte
+	closeCh          chan struct{}
+	writerDone       chan struct{}
+	closed           atomic.Bool
+	writerUp         atomic.Bool
+	writerOnce       sync.Once
+	kcpOnce          sync.Once
+	frameInterval    time.Duration
+	batchSize        int
+	outFrames        atomic.Uint64
+	outBytes         atomic.Uint64
+	inFrames         atomic.Uint64
+	inBytes          atomic.Uint64
+	lastStats        atomic.Int64
+	lastEpochReset   atomic.Int64
+	lastIngressAt    atomic.Int64
+	localReconnectAt atomic.Int64
+	firstPeerAt      atomic.Int64
+	activeTrackID    atomic.Uint64
 
 	// localEpoch is bumped on every KCP session restart and stamped into
 	// every outgoing VP8 frame. peerEpoch tracks the last epoch we observed
@@ -283,6 +285,7 @@ func (p *streamTransport) SetReconnectCallback(cb func()) {
 	p.reconnectFn = cb
 	p.reconnectMu.Unlock()
 	p.stream.SetReconnectCallback(func() {
+		p.localReconnectAt.Store(time.Now().UnixNano())
 		p.resetKCP()
 		if cb != nil {
 			cb()
@@ -610,8 +613,16 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 			// Peer restarted its KCP session. Reset ours so the conv state
 			// machines re-converge. CAS guards against double-reset when
 			// fragmented frames straddle the epoch boundary.
+			if localReconnectAt := p.localReconnectAt.Load(); localReconnectAt != 0 && time.Duration(now-localReconnectAt) < 60*time.Second {
+				if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
+					p.lastEpochReset.Store(now)
+					logger.Infof("vp8channel: peer epoch accepted after local reconnect prev=0x%08x next=0x%08x", prev, peerEpoch)
+					p.resetKCP()
+				}
+				return
+			}
 			last := p.lastEpochReset.Load()
-			if last != 0 && time.Duration(now-last) < 45*time.Second {
+			if p.shouldSuppressPeerEpochChange(now, last) {
 				logger.Debugf(
 					"vp8channel: peer epoch change suppressed prev=0x%08x next=0x%08x",
 					prev,
@@ -621,7 +632,11 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 			}
 			if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
 				p.lastEpochReset.Store(now)
-				logger.Infof("vp8channel: peer epoch changed prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
+				if p.inFrames.Load() == 0 {
+					logger.Infof("vp8channel: peer epoch accepted during zero ingress prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
+				} else {
+					logger.Infof("vp8channel: peer epoch changed prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
+				}
 				p.resetKCP()
 				p.reconnectMu.Lock()
 				fn := p.reconnectFn
@@ -645,6 +660,20 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	p.deliverKCPPacket(kcpPayload)
 }
 
+func (p *streamTransport) shouldSuppressPeerEpochChange(now int64, lastEpochReset int64) bool {
+	if lastEpochReset == 0 || time.Duration(now-lastEpochReset) >= 45*time.Second {
+		return false
+	}
+	if p.inFrames.Load() == 0 {
+		return false
+	}
+	lastIngressAt := p.lastIngressAt.Load()
+	if lastIngressAt == 0 {
+		return false
+	}
+	return time.Duration(now-lastIngressAt) < 20*time.Second
+}
+
 func (p *streamTransport) handleIncomingBatch(payload []byte) {
 	count := int(binary.BigEndian.Uint16(payload[4:6]))
 	off := 6
@@ -663,6 +692,7 @@ func (p *streamTransport) handleIncomingBatch(payload []byte) {
 }
 
 func (p *streamTransport) deliverKCPPacket(packet []byte) {
+	p.lastIngressAt.Store(time.Now().UnixNano())
 	p.inFrames.Add(1)
 	p.inBytes.Add(uint64(len(packet)))
 	p.maybeLogStats()

@@ -28,12 +28,12 @@ func resolveDNSOverUDPDirect(query []byte, dnsServer string) ([]byte, error) {
 	if len(query) > 65535 {
 		return nil, fmt.Errorf("dns query too large")
 	}
-	conn, err := net.DialTimeout("udp", dnsServer, 800*time.Millisecond)
+	conn, err := net.DialTimeout("udp", dnsServer, 1500*time.Millisecond)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(800 * time.Millisecond))
+	_ = conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
 	if _, err := conn.Write(query); err != nil {
 		return nil, err
 	}
@@ -52,12 +52,12 @@ func resolveDNSOverTCPDirectOnce(query []byte, dnsServer string) ([]byte, error)
 	if len(query) > 65535 {
 		return nil, fmt.Errorf("dns query too large")
 	}
-	conn, err := net.DialTimeout("tcp", dnsServer, 800*time.Millisecond)
+	conn, err := net.DialTimeout("tcp", dnsServer, 1500*time.Millisecond)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(800 * time.Millisecond))
+	_ = conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
 	prefix := []byte{byte(len(query) >> 8), byte(len(query))}
 	if _, err := conn.Write(prefix); err != nil {
 		return nil, err

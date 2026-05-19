@@ -13,11 +13,11 @@ import (
 )
 
 const (
-	packetFlowDNSServer           = "192.168.0.1:53"
-	packetFlowDNSAcquireTimeout   = 2 * time.Second
+	packetFlowDNSServer         = "192.168.0.1:53"
+	packetFlowDNSAcquireTimeout = 10 * time.Second
 )
 
-var packetFlowDNSSemaphore = make(chan struct{}, 32)
+var packetFlowDNSSemaphore = make(chan struct{}, 128)
 
 func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 	if !isIPv4UDP53(packet) {
@@ -36,17 +36,11 @@ func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 			defer func() { <-packetFlowDNSSemaphore }()
 		case <-time.After(packetFlowDNSAcquireTimeout):
 			atomic.AddUint64(&rw.dnsMiss, 1)
-			if failure, built := buildDNSFailureResponse(packetCopy); built {
-				_ = rw.Respond(failure)
-			}
 			return
 		}
 		resp, ok := buildDNSResponseViaTCP(packetCopy, rw.socksHost, rw.socksPort)
 		if !ok || len(resp) == 0 {
 			atomic.AddUint64(&rw.dnsMiss, 1)
-			if failure, built := buildDNSFailureResponse(packetCopy); built {
-				_ = rw.Respond(failure)
-			}
 			return
 		}
 		atomic.AddUint64(&rw.dnsAnswered, 1)
@@ -130,38 +124,44 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int) ([
 		return cached, nil
 	}
 
-	answer, carrierErr := resolveDNSOverTCPViaSocksOnce(query, socksHost, socksPort)
-	if isUsableDNSAnswer(answer, carrierErr) {
-		putCachedDNSAnswer(query, answer)
-		return answer, nil
-	}
+	return resolveDNSWithInflight(query, func() ([]byte, error) {
+		if cached, ok := getCachedDNSAnswer(query); ok {
+			return cached, nil
+		}
 
-	answer, directErr := resolveDNSOverUDPDirect(query, packetFlowDNSServer)
-	if isUsableDNSAnswer(answer, directErr) {
-		putCachedDNSAnswer(query, answer)
-		return answer, nil
-	}
+		answer, directErr := resolveDNSOverUDPDirect(query, packetFlowDNSServer)
+		if isUsableDNSAnswer(answer, directErr) {
+			putCachedDNSAnswer(query, answer)
+			return answer, nil
+		}
 
-	answer, tcpErr := resolveDNSOverTCPDirect(query, packetFlowDNSServer)
-	if isUsableDNSAnswer(answer, tcpErr) {
-		putCachedDNSAnswer(query, answer)
-		return answer, nil
-	}
+		answer, tcpErr := resolveDNSOverTCPDirectOnce(query, packetFlowDNSServer)
+		if isUsableDNSAnswer(answer, tcpErr) {
+			putCachedDNSAnswer(query, answer)
+			return answer, nil
+		}
 
-	if tcpErr != nil {
-		return nil, tcpErr
-	}
-	if directErr != nil {
-		return nil, directErr
-	}
-	if carrierErr != nil {
-		return nil, carrierErr
-	}
-	return nil, errors.New("empty or synthetic dns answer")
+		answer, carrierErr := resolveDNSOverTCPViaSocksOnce(query, socksHost, socksPort)
+		if isUsableDNSAnswer(answer, carrierErr) {
+			putCachedDNSAnswer(query, answer)
+			return answer, nil
+		}
+
+		if directErr != nil {
+			return nil, directErr
+		}
+		if tcpErr != nil {
+			return nil, tcpErr
+		}
+		if carrierErr != nil {
+			return nil, carrierErr
+		}
+		return nil, errors.New("empty or synthetic dns answer")
+	})
 }
 
 func isUsableDNSAnswer(answer []byte, err error) bool {
-	return err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer)
+	return err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer) && !isSyntheticDNSAnswer(answer)
 }
 
 func isRetryableDNSResponse(answer []byte) bool {
