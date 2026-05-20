@@ -129,6 +129,12 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int) ([
 			return cached, nil
 		}
 
+		answer, carrierErr := resolveDNSOverTCPViaSocksOnce(query, socksHost, socksPort)
+		if isUsableDNSAnswer(answer, carrierErr) {
+			putCachedDNSAnswer(query, answer)
+			return answer, nil
+		}
+
 		answer, directErr := resolveDNSOverUDPDirect(query, packetFlowDNSServer)
 		if isUsableDNSAnswer(answer, directErr) {
 			putCachedDNSAnswer(query, answer)
@@ -141,20 +147,14 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int) ([
 			return answer, nil
 		}
 
-		answer, carrierErr := resolveDNSOverTCPViaSocksOnce(query, socksHost, socksPort)
-		if isUsableDNSAnswer(answer, carrierErr) {
-			putCachedDNSAnswer(query, answer)
-			return answer, nil
+		if carrierErr != nil {
+			return nil, carrierErr
 		}
-
 		if directErr != nil {
 			return nil, directErr
 		}
 		if tcpErr != nil {
 			return nil, tcpErr
-		}
-		if carrierErr != nil {
-			return nil, carrierErr
 		}
 		return nil, errors.New("empty or synthetic dns answer")
 	})
