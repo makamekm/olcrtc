@@ -446,6 +446,9 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
 
 func (s *Server) dial(req ConnectRequest) (net.Conn, error) {
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
+	if isSyntheticIPv4Address(req.Addr) {
+		return nil, fmt.Errorf("reject synthetic fake-ip address: %s", req.Addr)
+	}
 	if s.socksProxyAddr == "" {
 		dialer := &net.Dialer{
 			Timeout:   10 * time.Second,
