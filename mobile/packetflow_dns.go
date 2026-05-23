@@ -13,11 +13,21 @@ import (
 )
 
 const (
-	packetFlowDNSServer         = "192.168.0.1:53"
+	fallbackPacketFlowDNSServer = defaultDNSServer
 	packetFlowDNSAcquireTimeout = 10 * time.Second
 )
 
 var packetFlowDNSSemaphore = make(chan struct{}, 128)
+
+func currentPacketFlowDNSServer() string {
+	mu.Lock()
+	defer mu.Unlock()
+	ensureDefaultConfigLocked()
+	if defaults.dnsServer == "" {
+		return fallbackPacketFlowDNSServer
+	}
+	return defaults.dnsServer
+}
 
 func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 	if !isIPv4UDP53(packet) {
@@ -38,7 +48,11 @@ func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 			atomic.AddUint64(&rw.dnsMiss, 1)
 			return
 		}
-		resp, ok := buildDNSResponseViaTCP(packetCopy, rw.socksHost, rw.socksPort)
+		dnsServer := rw.dnsServer
+		if dnsServer == "" {
+			dnsServer = fallbackPacketFlowDNSServer
+		}
+		resp, ok := buildDNSResponseViaTCP(packetCopy, rw.socksHost, rw.socksPort, dnsServer)
 		if !ok || len(resp) == 0 {
 			atomic.AddUint64(&rw.dnsMiss, 1)
 			return
@@ -68,7 +82,7 @@ func isIPv4UDP53(packet []byte) bool {
 	return binary.BigEndian.Uint16(packet[ihl+2:ihl+4]) == 53
 }
 
-func buildDNSResponseViaTCP(packet []byte, socksHost string, socksPort int) ([]byte, bool) {
+func buildDNSResponseViaTCP(packet []byte, socksHost string, socksPort int, dnsServer string) ([]byte, bool) {
 	if len(packet) < 28 || packet[0]>>4 != 4 {
 		return nil, false
 	}
@@ -91,7 +105,7 @@ func buildDNSResponseViaTCP(packet []byte, socksHost string, socksPort int) ([]b
 		return nil, false
 	}
 	query := append([]byte(nil), udp[8:udpLen]...)
-	answer, err := resolveDNSOverTCPViaSocks(query, socksHost, socksPort)
+	answer, err := resolveDNSOverTCPViaSocks(query, socksHost, socksPort, dnsServer)
 	if err != nil || len(answer) == 0 {
 		return nil, false
 	}
@@ -119,9 +133,12 @@ func buildDNSResponseViaTCP(packet []byte, socksHost string, socksPort int) ([]b
 	return resp, true
 }
 
-func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int) ([]byte, error) {
+func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int, dnsServer string) ([]byte, error) {
 	if cached, ok := getCachedDNSAnswer(query); ok {
 		return cached, nil
+	}
+	if dnsServer == "" {
+		dnsServer = fallbackPacketFlowDNSServer
 	}
 
 	return resolveDNSWithInflight(query, func() ([]byte, error) {
@@ -129,19 +146,19 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int) ([
 			return cached, nil
 		}
 
-		answer, carrierErr := resolveDNSOverTCPViaSocksOnce(query, socksHost, socksPort)
+		answer, carrierErr := resolveDNSOverTCPViaSocksOnce(query, socksHost, socksPort, dnsServer)
 		if isUsableDNSAnswer(answer, carrierErr) {
 			putCachedDNSAnswer(query, answer)
 			return answer, nil
 		}
 
-		answer, directErr := resolveDNSOverUDPDirect(query, packetFlowDNSServer)
+		answer, directErr := resolveDNSOverUDPDirect(query, dnsServer)
 		if isUsableDNSAnswer(answer, directErr) {
 			putCachedDNSAnswer(query, answer)
 			return answer, nil
 		}
 
-		answer, tcpErr := resolveDNSOverTCPDirectOnce(query, packetFlowDNSServer)
+		answer, tcpErr := resolveDNSOverTCPDirectOnce(query, dnsServer)
 		if isUsableDNSAnswer(answer, tcpErr) {
 			putCachedDNSAnswer(query, answer)
 			return answer, nil
@@ -172,7 +189,7 @@ func isRetryableDNSResponse(answer []byte) bool {
 	return rcode == 2 || rcode == 5 // SERVFAIL/REFUSED: retry via carrier, never cache.
 }
 
-func resolveDNSOverTCPViaSocksOnce(query []byte, socksHost string, socksPort int) ([]byte, error) {
+func resolveDNSOverTCPViaSocksOnce(query []byte, socksHost string, socksPort int, dnsServer string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -182,7 +199,10 @@ func resolveDNSOverTCPViaSocksOnce(query []byte, socksHost string, socksPort int
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := socks5Connect(conn, packetFlowDNSServer); err != nil {
+	if dnsServer == "" {
+		dnsServer = fallbackPacketFlowDNSServer
+	}
+	if err := socks5Connect(conn, dnsServer); err != nil {
 		return nil, err
 	}
 	if len(query) > 65535 {

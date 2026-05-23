@@ -124,6 +124,7 @@ type packetFlowReadWriter struct {
 	mtu         int
 	socksHost   string
 	socksPort   int
+	dnsServer   string
 	inPackets   uint64
 	outPackets  uint64
 	dnsSeen     uint64
@@ -133,6 +134,7 @@ type packetFlowReadWriter struct {
 }
 
 func newPacketFlowReadWriter(mtu int, socksHost string, socksPort int) *packetFlowReadWriter {
+	dnsServer := currentPacketFlowDNSServer()
 	return &packetFlowReadWriter{
 		inbound:   make(chan []byte, 2048),
 		outbound:  make(chan []byte, 2048),
@@ -140,6 +142,7 @@ func newPacketFlowReadWriter(mtu int, socksHost string, socksPort int) *packetFl
 		mtu:       mtu,
 		socksHost: socksHost,
 		socksPort: socksPort,
+		dnsServer: dnsServer,
 	}
 }
 
