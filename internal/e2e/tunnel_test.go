@@ -506,6 +506,7 @@ type tunnelRuntime struct {
 
 func startTunnel(t *testing.T, serverClientID, clientClientID string) *tunnelRuntime {
 	t.Helper()
+	t.Setenv("OLCRTC_ALLOW_BLOCKED_EGRESS", "1")
 
 	carrierName, room := registerMemoryCarrier(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -596,6 +597,7 @@ func startRealTunnel(
 	carrierName, transportName, roomURL, serverClientID, clientClientID string,
 ) (*tunnelRuntime, error) {
 	t.Helper()
+	t.Setenv("OLCRTC_ALLOW_BLOCKED_EGRESS", "1")
 
 	session.RegisterDefaults()
 	socksAddr := freeLocalAddr(ctx, t)

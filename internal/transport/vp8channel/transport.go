@@ -49,9 +49,10 @@ import (
 const (
 	defaultMaxPayloadSize = 8 * 1024
 	defaultConnectTimeout = 60 * time.Second
-	rtpBufSize            = 65536
-	outboundQueueSize     = 1024
-	inboundQueueSize      = 1024
+	rtpBufSize            = 131072
+	outboundQueueSize     = 4096
+	inboundQueueSize      = 4096
+	maxDynamicBatchSize   = 64
 	canSendHighWatermark  = 90 // percent
 	keepaliveIdlePeriod   = 100 * time.Millisecond
 )
@@ -388,10 +389,7 @@ func (p *streamTransport) maybeLogStats() {
 }
 
 func (p *streamTransport) collectOutboundBatch() [][]byte {
-	limit := p.batchSize
-	if limit < 1 {
-		limit = 1
-	}
+	limit := p.dynamicBatchLimit()
 	frames := make([][]byte, 0, limit)
 	for len(frames) < limit {
 		select {
@@ -402,6 +400,27 @@ func (p *streamTransport) collectOutboundBatch() [][]byte {
 		}
 	}
 	return frames
+}
+
+func (p *streamTransport) dynamicBatchLimit() int {
+	limit := p.batchSize
+	if limit < 1 {
+		limit = 1
+	}
+	queued := len(p.outbound)
+	capacity := cap(p.outbound)
+	if capacity > 0 {
+		switch {
+		case queued >= capacity/2:
+			limit *= 4
+		case queued >= capacity/4:
+			limit *= 2
+		}
+	}
+	if limit > maxDynamicBatchSize {
+		limit = maxDynamicBatchSize
+	}
+	return limit
 }
 
 func (p *streamTransport) buildSample(frames [][]byte) []byte {

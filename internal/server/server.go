@@ -22,7 +22,10 @@ import (
 	"github.com/xtaci/smux"
 )
 
-const connectCommand = "connect"
+const (
+	connectCommand = "connect"
+	udpCommand     = "udp"
+)
 
 var (
 	// ErrKeyRequired is returned when no encryption key is provided.
@@ -383,6 +386,7 @@ func (s *Server) handleStream(_ context.Context, stream *smux.Stream) {
 				_ = stream.SetReadDeadline(time.Time{})
 				if !s.authorizeRequest(req) {
 					logger.Warnf("sid=%d rejected: client_id mismatch", stream.ID())
+					_, _ = stream.Write([]byte{0x01})
 					return
 				}
 				s.dispatch(stream, req)
@@ -403,7 +407,7 @@ func parseConnectRequest(buf []byte) (ConnectRequest, bool) {
 	if err := json.Unmarshal(buf, &req); err != nil {
 		return req, false
 	}
-	if req.Cmd != connectCommand {
+	if req.Cmd != connectCommand && req.Cmd != udpCommand {
 		return req, false
 	}
 	return req, true
@@ -418,6 +422,11 @@ func serverClientIdentity(clientID string) string {
 }
 
 func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
+	if req.Cmd == udpCommand {
+		s.dispatchUDP(stream, req)
+		return
+	}
+
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
 	logger.Infof("sid=%d connect %s", stream.ID(), addr)
 
@@ -427,6 +436,7 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
 
 	if err != nil {
 		logger.Infof("sid=%d dial %s failed (%v): %v", stream.ID(), addr, dialElapsed, err)
+		_, _ = stream.Write([]byte{0x01})
 		return
 	}
 	defer func() { _ = conn.Close() }()
@@ -446,8 +456,8 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
 
 func (s *Server) dial(req ConnectRequest) (net.Conn, error) {
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
-	if isSyntheticIPv4Address(req.Addr) {
-		return nil, fmt.Errorf("reject synthetic fake-ip address: %s", req.Addr)
+	if isBlockedEgressIPv4Address(req.Addr) {
+		return nil, fmt.Errorf("reject non-public egress address: %s", req.Addr)
 	}
 	if s.socksProxyAddr == "" {
 		dialer := &net.Dialer{

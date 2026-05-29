@@ -27,7 +27,7 @@ type fakeVideoSession struct {
 func TestCollectOutboundBatch(t *testing.T) {
 	tr := &streamTransport{
 		batchSize: 3,
-		outbound:  make(chan []byte, 4),
+		outbound:  make(chan []byte, 32),
 	}
 	tr.outbound <- []byte("one")
 	tr.outbound <- []byte("two")

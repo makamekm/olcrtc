@@ -111,6 +111,28 @@ func TestVP8KeepaliveDoesNotLookLikeKCP(t *testing.T) {
 	}
 }
 
+func TestDynamicBatchLimitRaisesOnlyUnderBackpressure(t *testing.T) {
+	tr := &streamTransport{
+		batchSize: 16,
+		outbound:  make(chan []byte, outboundQueueSize),
+	}
+	if got := tr.dynamicBatchLimit(); got != 16 {
+		t.Fatalf("empty queue dynamicBatchLimit() = %d, want 16", got)
+	}
+	for i := 0; i < cap(tr.outbound)/4; i++ {
+		tr.outbound <- []byte{0x01}
+	}
+	if got := tr.dynamicBatchLimit(); got != 32 {
+		t.Fatalf("quarter queue dynamicBatchLimit() = %d, want 32", got)
+	}
+	for i := len(tr.outbound); i < cap(tr.outbound)/2; i++ {
+		tr.outbound <- []byte{0x01}
+	}
+	if got := tr.dynamicBatchLimit(); got != maxDynamicBatchSize {
+		t.Fatalf("half queue dynamicBatchLimit() = %d, want %d", got, maxDynamicBatchSize)
+	}
+}
+
 func testEpochHdr(epoch uint32) [epochHdrLen]byte {
 	var hdr [epochHdrLen]byte
 	copy(hdr[:], vp8Keepalive)

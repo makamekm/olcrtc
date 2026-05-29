@@ -226,12 +226,14 @@ func (c *Client) bringUpLink(
 		return fmt.Errorf("failed to connect link: %w", err)
 	}
 
-	c.conn = muxconn.New(ln, c.cipher)
-	sess, err := smux.Client(c.conn, smuxConfig())
+	conn := muxconn.New(ln, c.cipher)
+	sess, err := smux.Client(conn, smuxConfig())
 	if err != nil {
+		_ = conn.Close()
 		return fmt.Errorf("smux client: %w", err)
 	}
 	c.sessMu.Lock()
+	c.conn = conn
 	c.session = sess
 	c.sessMu.Unlock()
 
@@ -274,13 +276,15 @@ func (c *Client) handleReconnect() {
 		c.conn = nil
 	}
 	c.sessMu.Unlock()
-	c.conn = muxconn.New(c.ln, c.cipher)
-	sess, err := smux.Client(c.conn, smuxConfig())
+	conn := muxconn.New(c.ln, c.cipher)
+	sess, err := smux.Client(conn, smuxConfig())
 	if err != nil {
+		_ = conn.Close()
 		logger.Warnf("smux re-init failed: %v", err)
 		return
 	}
 	c.sessMu.Lock()
+	c.conn = conn
 	c.session = sess
 	c.sessMu.Unlock()
 }
@@ -347,8 +351,23 @@ func (c *Client) handleSocks5(_ context.Context, conn net.Conn) {
 		return
 	}
 
-	targetAddr, targetPort, err := c.socks5Request(conn)
+	targetAddr, targetPort, command, err := c.socks5Request(conn)
 	if err != nil {
+		return
+	}
+
+	if command == 3 {
+		c.handleUDPAssociate(conn)
+		return
+	}
+
+	if !allowBlockedEgressTargets() && isBlockedEgressTarget(targetAddr) {
+		logger.Infof("reject non-public egress target locally: %s:%d", targetAddr, targetPort)
+		_, _ = conn.Write(replyHostUnreachable())
+		return
+	}
+	if serveConnectivityProbeLocally(conn, targetAddr, targetPort) {
+		logger.Debugf("served connectivity probe locally: %s:%d", targetAddr, targetPort)
 		return
 	}
 
@@ -410,10 +429,14 @@ func (c *Client) sendConnectRequest(stream *smux.Stream, targetAddr string, targ
 
 	ack := make([]byte, 1)
 	_ = stream.SetReadDeadline(time.Now().Add(15 * time.Second))
-	if _, err := io.ReadFull(stream, ack); err != nil || ack[0] != 0x00 {
-		return fmt.Errorf("sid=%d: %w (read_err=%w ack=%v)", stream.ID(), ErrRemoteNotReady, err, ack)
-	}
+	_, err = io.ReadFull(stream, ack)
 	_ = stream.SetReadDeadline(time.Time{})
+	if err != nil {
+		return fmt.Errorf("sid=%d: %w (read_err=%v ack=%v)", stream.ID(), ErrRemoteNotReady, err, ack)
+	}
+	if ack[0] != 0x00 {
+		return fmt.Errorf("%w: remote rejected target (ack=%d)", ErrRemoteNotReady, ack[0])
+	}
 	return nil
 }
 
@@ -483,27 +506,27 @@ func (c *Client) socks5UserPassAuth(conn net.Conn) error {
 	return nil
 }
 
-func (c *Client) socks5Request(conn net.Conn) (string, int, error) {
+func (c *Client) socks5Request(conn net.Conn) (string, int, byte, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return "", 0, fmt.Errorf("read socks5 request: %w", err)
+		return "", 0, 0, fmt.Errorf("read socks5 request: %w", err)
 	}
-	if header[1] != 1 {
-		return "", 0, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, header[1])
+	if header[1] != 1 && header[1] != 3 {
+		return "", 0, 0, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, header[1])
 	}
 
 	addr, err := c.readSocks5Addr(conn, header[3])
 	if err != nil {
-		return "", 0, err
+		return "", 0, 0, err
 	}
 
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
-		return "", 0, fmt.Errorf("read socks5 port: %w", err)
+		return "", 0, 0, fmt.Errorf("read socks5 port: %w", err)
 	}
 	port := int(binary.BigEndian.Uint16(portBuf))
 
-	return addr, port, nil
+	return addr, port, header[1], nil
 }
 
 func (c *Client) readSocks5Addr(conn net.Conn, addrType byte) (string, error) {
