@@ -4,11 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type androidTunReadWriter struct {
+	closeOnce sync.Once
+	closeErr  error
 	tun       io.ReadWriteCloser
 	mtu       int
 	socksHost string
@@ -90,10 +93,15 @@ func (rw *androidTunReadWriter) Respond(packet []byte) error {
 }
 
 func (rw *androidTunReadWriter) Close() error {
-	if rw == nil || rw.tun == nil {
+	if rw == nil {
 		return nil
 	}
-	return rw.tun.Close()
+	rw.closeOnce.Do(func() {
+		if rw.tun != nil {
+			rw.closeErr = rw.tun.Close()
+		}
+	})
+	return rw.closeErr
 }
 
 func (rw *androidTunReadWriter) tryHandleDNS(packet []byte) bool {
