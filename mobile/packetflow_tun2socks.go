@@ -182,6 +182,9 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 	}
 	if isIPv4UDP(packet) {
 		atomic.AddUint64(&rw.udpDropped, 1)
+		if resp, ok := buildIPv4ICMPPortUnreachable(packet); ok {
+			_ = rw.Respond(resp)
+		}
 		return nil
 	}
 	atomic.AddUint64(&rw.inPackets, 1)
