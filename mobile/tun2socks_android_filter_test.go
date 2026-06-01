@@ -87,6 +87,31 @@ func TestAndroidTunReadWriterRejectsNonDNSUDPWithICMP(t *testing.T) {
 	}
 }
 
+func TestPacketFlowReadWriterForwardsNonDNSUDPToTun2Socks(t *testing.T) {
+	resetMobileGlobals(t)
+	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
+
+	packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, 443, []byte("quic"))
+	if err := rw.Inject(packet); err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+
+	select {
+	case got := <-rw.inbound:
+		if string(got) != string(packet) {
+			t.Fatalf("forwarded packet mismatch")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for UDP packet to be forwarded")
+	}
+	if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 0 {
+		t.Fatalf("udpDropped = %d, want 0", dropped)
+	}
+	if in := atomic.LoadUint64(&rw.inPackets); in != 1 {
+		t.Fatalf("inPackets = %d, want 1", in)
+	}
+}
+
 func waitMemoryTunWrite(t *testing.T, tun *memoryTun) []byte {
 	t.Helper()
 	select {

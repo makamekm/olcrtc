@@ -180,13 +180,6 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 	if rw.tryHandleDNS(packet) {
 		return nil
 	}
-	if isIPv4UDP(packet) {
-		atomic.AddUint64(&rw.udpDropped, 1)
-		if resp, ok := buildIPv4ICMPPortUnreachable(packet); ok {
-			return rw.Respond(resp)
-		}
-		return nil
-	}
 	atomic.AddUint64(&rw.inPackets, 1)
 	copyPacket := append([]byte(nil), packet...)
 	select {
