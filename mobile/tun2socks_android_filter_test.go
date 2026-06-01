@@ -87,7 +87,7 @@ func TestAndroidTunReadWriterRejectsNonDNSUDPWithICMP(t *testing.T) {
 	}
 }
 
-func TestPacketFlowReadWriterForwardsNonDNSUDPToTun2Socks(t *testing.T) {
+func TestPacketFlowReadWriterDropsNonDNSUDPSilently(t *testing.T) {
 	resetMobileGlobals(t)
 	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
 
@@ -98,17 +98,19 @@ func TestPacketFlowReadWriterForwardsNonDNSUDPToTun2Socks(t *testing.T) {
 
 	select {
 	case got := <-rw.inbound:
-		if string(got) != string(packet) {
-			t.Fatalf("forwarded packet mismatch")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for UDP packet to be forwarded")
+		t.Fatalf("unexpected forwarded UDP packet len=%d", len(got))
+	default:
 	}
-	if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 0 {
-		t.Fatalf("udpDropped = %d, want 0", dropped)
+	select {
+	case got := <-rw.outbound:
+		t.Fatalf("unexpected UDP response packet len=%d", len(got))
+	default:
 	}
-	if in := atomic.LoadUint64(&rw.inPackets); in != 1 {
-		t.Fatalf("inPackets = %d, want 1", in)
+	if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 1 {
+		t.Fatalf("udpDropped = %d, want 1", dropped)
+	}
+	if in := atomic.LoadUint64(&rw.inPackets); in != 0 {
+		t.Fatalf("inPackets = %d, want 0", in)
 	}
 }
 
