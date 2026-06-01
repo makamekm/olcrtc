@@ -87,7 +87,7 @@ func TestAndroidTunReadWriterRejectsNonDNSUDPWithICMP(t *testing.T) {
 	}
 }
 
-func TestPacketFlowReadWriterRejectsNonDNSUDPWithICMP(t *testing.T) {
+func TestPacketFlowReadWriterSilentlyDropsNonDNSUDP(t *testing.T) {
 	resetMobileGlobals(t)
 	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
 
@@ -103,11 +103,8 @@ func TestPacketFlowReadWriterRejectsNonDNSUDPWithICMP(t *testing.T) {
 	}
 	select {
 	case got := <-rw.outbound:
-		if len(got) == 0 || got[9] != 1 {
-			t.Fatalf("unexpected ICMP response packet len=%d proto=%d", len(got), got[9])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for ICMP unreachable")
+		t.Fatalf("unexpected outbound response for silently-dropped UDP len=%d proto=%d", len(got), got[9])
+	default:
 	}
 	if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 1 {
 		t.Fatalf("udpDropped = %d, want 1", dropped)

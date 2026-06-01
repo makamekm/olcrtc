@@ -181,10 +181,12 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 		return nil
 	}
 	if isIPv4UDP(packet) {
+		// iOS NEPacketTunnelFlow is sensitive to ICMP-unreachable storms from
+		// YouTube/Safari QUIC probes. DNS is answered above; other UDP is not
+		// supported by the TCP/SOCKS tunnel, so drop it silently and let the
+		// application fall back to TCP instead of feeding ICMP responses back into
+		// the packet flow.
 		atomic.AddUint64(&rw.udpDropped, 1)
-		if resp, ok := buildIPv4ICMPPortUnreachable(packet); ok {
-			_ = rw.Respond(resp)
-		}
 		return nil
 	}
 	atomic.AddUint64(&rw.inPackets, 1)
