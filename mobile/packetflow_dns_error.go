@@ -8,7 +8,9 @@ func buildLocalDNSNoDataResponse(packet []byte) ([]byte, bool) {
 		return nil, false
 	}
 	switch qtype {
-	case 28, 64, 65: // AAAA/SVCB/HTTPS: IPv4-only tunnel, avoid DNS-over-carrier storms.
+	case 28: // AAAA: IPv4-only tunnel, avoid IPv6 DNS-over-carrier stalls.
+		return buildDNSResponseWithPayload(packet, buildDNSNoDataPayload(query))
+	case 64, 65: // SVCB/HTTPS: force classic A/IPv4 TCP path; avoids h3/ECH/alt endpoint choices unsupported by this tunnel.
 		return buildDNSResponseWithPayload(packet, buildDNSNoDataPayload(query))
 	default:
 		return nil, false

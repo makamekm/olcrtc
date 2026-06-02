@@ -34,6 +34,7 @@ func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 		return false
 	}
 	atomic.AddUint64(&rw.dnsSeen, 1)
+	rw.countDNSQuestionType(packet)
 	packetCopy := append([]byte(nil), packet...)
 	go func() {
 		if resp, ok := buildLocalDNSNoDataResponse(packetCopy); ok {
@@ -57,6 +58,7 @@ func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 			atomic.AddUint64(&rw.dnsMiss, 1)
 			return
 		}
+		rw.countDNSAnswer(packetCopy, resp)
 		atomic.AddUint64(&rw.dnsAnswered, 1)
 		_ = rw.Respond(resp)
 	}()

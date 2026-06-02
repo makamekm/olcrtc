@@ -1,6 +1,8 @@
 package server
 
 import (
+	"errors"
+	"io"
 	"net"
 	"strconv"
 	"time"
@@ -8,6 +10,8 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/xtaci/smux"
 )
+
+const udpRelayIdleTimeout = 30 * time.Second
 
 func (s *Server) dispatchUDP(stream *smux.Stream, req ConnectRequest) {
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
@@ -37,26 +41,49 @@ func (s *Server) dispatchUDP(stream *smux.Stream, req ConnectRequest) {
 		return
 	}
 
-	payload, err := readLengthPrefixedDatagram(stream, 4096)
-	if err != nil || len(payload) == 0 {
-		logger.Infof("sid=%d udp payload read %s failed: bytes=%d err=%v", stream.ID(), addr, len(payload), err)
-		return
-	}
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	logger.Debugf("sid=%d udp request %s bytes=%d", stream.ID(), addr, len(payload))
-	if _, err := conn.Write(payload); err != nil {
-		logger.Infof("sid=%d udp write %s failed: %v", stream.ID(), addr, err)
-		return
-	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 65535)
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(udpRelayIdleTimeout))
+			n, err := conn.Read(buf)
+			if err != nil {
+				if !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
+					logger.Debugf("sid=%d udp read %s ended: %v", stream.ID(), addr, err)
+				}
+				return
+			}
+			logger.Debugf("sid=%d udp response %s bytes=%d", stream.ID(), addr, n)
+			_ = stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := writeLengthPrefixedDatagram(stream, buf[:n]); err != nil {
+				logger.Infof("sid=%d udp response write failed: %v", stream.ID(), err)
+				return
+			}
+			_ = stream.SetWriteDeadline(time.Time{})
+		}
+	}()
 
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil {
-		logger.Infof("sid=%d udp read %s failed: %v", stream.ID(), addr, err)
-		return
-	}
-	logger.Debugf("sid=%d udp response %s bytes=%d", stream.ID(), addr, n)
-	if err := writeLengthPrefixedDatagram(stream, buf[:n]); err != nil {
-		logger.Infof("sid=%d udp response write failed: %v", stream.ID(), err)
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		_ = stream.SetReadDeadline(time.Now().Add(udpRelayIdleTimeout))
+		payload, err := readLengthPrefixedDatagram(stream, 65535)
+		if err != nil || len(payload) == 0 {
+			if err != nil && !errors.Is(err, io.EOF) {
+				logger.Debugf("sid=%d udp payload read %s ended: bytes=%d err=%v", stream.ID(), addr, len(payload), err)
+			}
+			return
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		logger.Debugf("sid=%d udp request %s bytes=%d", stream.ID(), addr, len(payload))
+		if _, err := conn.Write(payload); err != nil {
+			logger.Infof("sid=%d udp write %s failed: %v", stream.ID(), addr, err)
+			return
+		}
+		_ = conn.SetWriteDeadline(time.Time{})
 	}
 }

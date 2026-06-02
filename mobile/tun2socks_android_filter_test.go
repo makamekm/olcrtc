@@ -98,7 +98,7 @@ func TestPacketFlowReadWriterRejectsNonDNSUDPWithRateLimitedICMP(t *testing.T) {
 
 	select {
 	case got := <-rw.inbound:
-		t.Fatalf("unexpected forwarded UDP packet len=%d", len(got))
+		t.Fatalf("unexpected forwarded UDP packet len=%d proto=%d", len(got), got[9])
 	default:
 	}
 	select {
@@ -106,7 +106,7 @@ func TestPacketFlowReadWriterRejectsNonDNSUDPWithRateLimitedICMP(t *testing.T) {
 		if got[9] != 1 || got[20] != 3 || got[21] != 3 {
 			t.Fatalf("response protocol/type/code = %d/%d/%d, want ICMP destination-port-unreachable", got[9], got[20], got[21])
 		}
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("missing ICMP unreachable response for non-DNS UDP")
 	}
 

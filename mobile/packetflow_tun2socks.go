@@ -118,22 +118,29 @@ func MobileReadPacket(timeoutMillis int64) ([]byte, error) {
 }
 
 type packetFlowReadWriter struct {
-	inbound     chan []byte
-	outbound    chan []byte
-	closed      chan struct{}
-	once        sync.Once
-	mtu         int
-	socksHost   string
-	socksPort   int
-	dnsServer   string
-	udpRejectMu sync.Mutex
-	udpReject   map[string]time.Time
-	inPackets   uint64
-	outPackets  uint64
-	dnsSeen     uint64
-	dnsAnswered uint64
-	dnsMiss     uint64
-	udpDropped  uint64
+	inbound      chan []byte
+	outbound     chan []byte
+	closed       chan struct{}
+	once         sync.Once
+	mtu          int
+	socksHost    string
+	socksPort    int
+	dnsServer    string
+	udpRejectMu  sync.Mutex
+	udpReject    map[string]time.Time
+	inPackets    uint64
+	outPackets   uint64
+	dnsSeen      uint64
+	dnsAnswered  uint64
+	dnsMiss      uint64
+	dnsA         uint64
+	dnsAAAA      uint64
+	dnsHTTPS     uint64
+	dnsSVCB      uint64
+	dnsOther     uint64
+	dnsAWithIPv4 uint64
+	dnsAEmpty    uint64
+	udpDropped   uint64
 }
 
 func newPacketFlowReadWriter(mtu int, socksHost string, socksPort int) *packetFlowReadWriter {
@@ -246,6 +253,62 @@ func (rw *packetFlowReadWriter) Close() {
 	rw.once.Do(func() { close(rw.closed) })
 }
 
+func (rw *packetFlowReadWriter) countDNSQuestionType(packet []byte) {
+	_, qtype, ok := dnsQuestionFromIPv4UDP(packet)
+	if !ok {
+		atomic.AddUint64(&rw.dnsOther, 1)
+		return
+	}
+	switch qtype {
+	case 1:
+		atomic.AddUint64(&rw.dnsA, 1)
+	case 28:
+		atomic.AddUint64(&rw.dnsAAAA, 1)
+	case 64:
+		atomic.AddUint64(&rw.dnsSVCB, 1)
+	case 65:
+		atomic.AddUint64(&rw.dnsHTTPS, 1)
+	default:
+		atomic.AddUint64(&rw.dnsOther, 1)
+	}
+}
+
+func (rw *packetFlowReadWriter) countDNSAnswer(queryPacket []byte, responsePacket []byte) {
+	_, qtype, ok := dnsQuestionFromIPv4UDP(queryPacket)
+	if !ok || qtype != 1 {
+		return
+	}
+	payload, ok := dnsPayloadFromIPv4UDP(responsePacket)
+	if !ok || len(packetFlowDNSAnswerIPv4s(payload)) == 0 {
+		atomic.AddUint64(&rw.dnsAEmpty, 1)
+		return
+	}
+	atomic.AddUint64(&rw.dnsAWithIPv4, 1)
+}
+
+func dnsPayloadFromIPv4UDP(packet []byte) ([]byte, bool) {
+	if len(packet) < 28 || packet[0]>>4 != 4 {
+		return nil, false
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if ihl < 20 || len(packet) < ihl+8 || packet[9] != 17 {
+		return nil, false
+	}
+	totalLen := int(binary.BigEndian.Uint16(packet[2:4]))
+	if totalLen <= 0 || totalLen > len(packet) {
+		totalLen = len(packet)
+	}
+	udp := packet[ihl:totalLen]
+	if len(udp) < 8 {
+		return nil, false
+	}
+	udpLen := int(binary.BigEndian.Uint16(udp[4:6]))
+	if udpLen < 8 || len(udp) < udpLen {
+		return nil, false
+	}
+	return udp[8:udpLen], true
+}
+
 func (rw *packetFlowReadWriter) shouldRejectUDP(packet []byte) bool {
 	key, ok := ipv4UDPFlowKey(packet)
 	if !ok {
@@ -281,6 +344,17 @@ func ipv4UDPFlowKey(packet []byte) (string, bool) {
 	return fmt.Sprintf("%08x:%d>%08x:%d", binary.BigEndian.Uint32(packet[12:16]), binary.BigEndian.Uint16(udp[0:2]), binary.BigEndian.Uint32(packet[16:20]), binary.BigEndian.Uint16(udp[2:4])), true
 }
 
+func isIPv4UDPDstPort(packet []byte, port uint16) bool {
+	if !isIPv4UDP(packet) {
+		return false
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if len(packet) < ihl+8 {
+		return false
+	}
+	return binary.BigEndian.Uint16(packet[ihl+2:ihl+4]) == port
+}
+
 func MobilePacketFlowDebugStats() string {
 	packetFlowTun2Socks.mu.Lock()
 	rw := packetFlowTun2Socks.rw
@@ -288,5 +362,5 @@ func MobilePacketFlowDebugStats() string {
 	if rw == nil {
 		return "packetflow=stopped"
 	}
-	return fmt.Sprintf("packetflow=running in=%d out=%d dns_seen=%d dns_answered=%d dns_miss=%d udp_dropped=%d", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.udpDropped))
+	return fmt.Sprintf("packetflow=running in=%d out=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d udp_dropped=%d", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.udpDropped))
 }

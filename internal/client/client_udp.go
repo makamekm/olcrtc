@@ -3,13 +3,32 @@ package client
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 )
+
+const udpRelayIdleTimeout = 30 * time.Second
+const udpRelayMaxClientAddrs = 8
+
+type udpRelaySession struct {
+	key         string
+	targetAddr  string
+	targetPort  int
+	clientAddrs map[string]*net.UDPAddr
+	clientOrder []string
+	udpConn     *net.UDPConn
+	stream      net.Conn
+	mu          sync.Mutex
+	closeOnce   sync.Once
+	closed      chan struct{}
+	onClose     func(string)
+}
 
 func (c *Client) handleUDPAssociate(control net.Conn) {
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -31,6 +50,26 @@ func (c *Client) handleUDPAssociate(control net.Conn) {
 		_ = udpConn.Close()
 	}()
 
+	var relaysMu sync.Mutex
+	relays := map[string]*udpRelaySession{}
+	closeRelay := func(key string) {
+		relaysMu.Lock()
+		delete(relays, key)
+		relaysMu.Unlock()
+	}
+	defer func() {
+		relaysMu.Lock()
+		active := make([]*udpRelaySession, 0, len(relays))
+		for _, relay := range relays {
+			active = append(active, relay)
+		}
+		relays = map[string]*udpRelaySession{}
+		relaysMu.Unlock()
+		for _, relay := range active {
+			relay.Close()
+		}
+	}()
+
 	buf := make([]byte, 64*1024)
 	for {
 		select {
@@ -43,60 +82,175 @@ func (c *Client) handleUDPAssociate(control net.Conn) {
 			return
 		}
 		packet := append([]byte(nil), buf[:n]...)
-		go c.relayUDPDatagram(udpConn, clientAddr, packet)
+		targetAddr, targetPort, payload, err := parseSocksUDPDatagram(packet)
+		if err != nil || len(payload) == 0 {
+			continue
+		}
+		targetAddr, ok := normalizeUDPTarget(targetAddr, targetPort)
+		if !ok {
+			continue
+		}
+		key := udpRelayKey(targetAddr, targetPort)
+
+		relaysMu.Lock()
+		relay := relays[key]
+		if relay == nil || relay.IsClosed() {
+			relay, err = c.openUDPRelay(udpConn, clientAddr, key, targetAddr, targetPort, closeRelay)
+			if err != nil {
+				logger.Warnf("udp relay open %s:%d failed: %v", targetAddr, targetPort, err)
+				relaysMu.Unlock()
+				continue
+			}
+			relays[key] = relay
+		} else {
+			relay.UpdateClientAddr(clientAddr)
+		}
+		relaysMu.Unlock()
+
+		if err := relay.Send(payload); err != nil {
+			logger.Warnf("udp relay send %s failed: %v", key, err)
+			relay.Close()
+		}
 	}
 }
 
-func (c *Client) relayUDPDatagram(udpConn *net.UDPConn, clientAddr *net.UDPAddr, packet []byte) {
-	targetAddr, targetPort, payload, err := parseSocksUDPDatagram(packet)
-	if err != nil || len(payload) == 0 {
-		return
+func normalizeUDPTarget(targetAddr string, targetPort int) (string, bool) {
+	if targetPort == 53 {
+		if isBlockedEgressIPv4Address(targetAddr) {
+			logger.Debugf("udp DNS target %s:%d rewritten to 1.1.1.1:53", targetAddr, targetPort)
+			return "1.1.1.1", true
+		}
+		if isBlockedEgressHostname(targetAddr) {
+			logger.Debugf("udp DNS target %s:%d blocked locally", targetAddr, targetPort)
+			return "", false
+		}
+		return targetAddr, true
 	}
+	if isBlockedEgressIPv4Address(targetAddr) || isBlockedEgressHostname(targetAddr) {
+		logger.Debugf("udp target %s:%d blocked locally", targetAddr, targetPort)
+		return "", false
+	}
+	return targetAddr, true
+}
 
-	if targetPort != 53 {
-		return
-	}
-	if isBlockedEgressIPv4Address(targetAddr) {
-		logger.Debugf("udp DNS target %s:%d rewritten to 1.1.1.1:53", targetAddr, targetPort)
-		targetAddr = "1.1.1.1"
-	} else if isBlockedEgressHostname(targetAddr) {
-		logger.Debugf("udp DNS target %s:%d blocked locally", targetAddr, targetPort)
-		return
-	}
-
+func (c *Client) openUDPRelay(udpConn *net.UDPConn, clientAddr *net.UDPAddr, key, targetAddr string, targetPort int, onClose func(string)) (*udpRelaySession, error) {
 	c.sessMu.RLock()
 	sess := c.session
 	c.sessMu.RUnlock()
 	if sess == nil || sess.IsClosed() {
-		return
+		return nil, ErrRemoteNotReady
 	}
 
 	stream, err := sess.OpenStream()
 	if err != nil {
-		logger.Warnf("OpenStream UDP failed: %v", err)
-		return
+		return nil, err
 	}
-	defer func() { _ = stream.Close() }()
-
-	logger.Debugf("sid=%d udp tunnel to %s:%d", stream.ID(), targetAddr, targetPort)
 	if err := c.sendUDPRequest(stream, targetAddr, targetPort); err != nil {
-		logger.Warnf("sid=%d udp connect failed: %v", stream.ID(), err)
-		return
+		_ = stream.Close()
+		return nil, err
 	}
-	_ = stream.SetDeadline(time.Now().Add(6 * time.Second))
-	logger.Debugf("sid=%d udp send %s:%d bytes=%d", stream.ID(), targetAddr, targetPort, len(payload))
-	if err := writeLengthPrefixedDatagram(stream, payload); err != nil {
-		logger.Warnf("sid=%d udp payload write failed: %v", stream.ID(), err)
-		return
+	relay := &udpRelaySession{
+		key:         key,
+		targetAddr:  targetAddr,
+		targetPort:  targetPort,
+		clientAddrs: map[string]*net.UDPAddr{},
+		udpConn:     udpConn,
+		stream:      stream,
+		closed:      make(chan struct{}),
+		onClose:     onClose,
 	}
+	relay.UpdateClientAddr(clientAddr)
+	go relay.ReadLoop()
+	logger.Debugf("udp relay open %s target=%s:%d", key, targetAddr, targetPort)
+	return relay, nil
+}
 
-	response, err := readLengthPrefixedDatagram(stream, 4096)
-	if err != nil || len(response) == 0 {
-		logger.Warnf("sid=%d udp response read failed: bytes=%d err=%v", stream.ID(), len(response), err)
+func (r *udpRelaySession) Send(payload []byte) error {
+	select {
+	case <-r.closed:
+		return net.ErrClosed
+	default:
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stream == nil {
+		return net.ErrClosed
+	}
+	_ = r.stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	logger.Debugf("udp relay send %s bytes=%d", r.key, len(payload))
+	err := writeLengthPrefixedDatagram(r.stream, payload)
+	_ = r.stream.SetWriteDeadline(time.Time{})
+	return err
+}
+
+func (r *udpRelaySession) UpdateClientAddr(clientAddr *net.UDPAddr) {
+	if clientAddr == nil {
 		return
 	}
-	logger.Debugf("sid=%d udp recv %s:%d bytes=%d", stream.ID(), targetAddr, targetPort, len(response))
-	_, _ = udpConn.WriteToUDP(buildSocksUDPDatagram(targetAddr, targetPort, response), clientAddr)
+	key := clientAddr.String()
+	r.mu.Lock()
+	if _, exists := r.clientAddrs[key]; !exists {
+		r.clientOrder = append(r.clientOrder, key)
+	}
+	r.clientAddrs[key] = clientAddr
+	for len(r.clientOrder) > udpRelayMaxClientAddrs {
+		oldest := r.clientOrder[0]
+		r.clientOrder = r.clientOrder[1:]
+		delete(r.clientAddrs, oldest)
+	}
+	r.mu.Unlock()
+}
+
+func (r *udpRelaySession) ReadLoop() {
+	defer r.Close()
+	for {
+		_ = r.stream.SetReadDeadline(time.Now().Add(udpRelayIdleTimeout))
+		response, err := readLengthPrefixedDatagram(r.stream, 65535)
+		if err != nil || len(response) == 0 {
+			if err != nil && !errors.Is(err, io.EOF) {
+				logger.Debugf("udp relay recv %s ended: bytes=%d err=%v", r.key, len(response), err)
+			}
+			return
+		}
+		logger.Debugf("udp relay recv %s bytes=%d", r.key, len(response))
+		packet := buildSocksUDPDatagram(r.targetAddr, r.targetPort, response)
+		r.mu.Lock()
+		clientAddrs := make([]*net.UDPAddr, 0, len(r.clientOrder))
+		for i := len(r.clientOrder) - 1; i >= 0; i-- {
+			if clientAddr := r.clientAddrs[r.clientOrder[i]]; clientAddr != nil {
+				clientAddrs = append(clientAddrs, clientAddr)
+			}
+		}
+		r.mu.Unlock()
+		for _, clientAddr := range clientAddrs {
+			_, _ = r.udpConn.WriteToUDP(packet, clientAddr)
+		}
+	}
+}
+
+func (r *udpRelaySession) Close() {
+	r.closeOnce.Do(func() {
+		close(r.closed)
+		if r.stream != nil {
+			_ = r.stream.Close()
+		}
+		if r.onClose != nil {
+			r.onClose(r.key)
+		}
+	})
+}
+
+func (r *udpRelaySession) IsClosed() bool {
+	select {
+	case <-r.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+func udpRelayKey(targetAddr string, targetPort int) string {
+	return net.JoinHostPort(targetAddr, fmt.Sprint(targetPort))
 }
 
 func (c *Client) sendUDPRequest(stream net.Conn, targetAddr string, targetPort int) error {
