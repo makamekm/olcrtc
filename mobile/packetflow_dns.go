@@ -148,36 +148,50 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int, dn
 			return cached, nil
 		}
 
-		answer, carrierErr := resolveDNSOverTCPViaSocksOnce(query, socksHost, socksPort, dnsServer)
-		if isUsableDNSAnswer(answer, carrierErr) {
-			putCachedDNSAnswer(query, answer)
-			return answer, nil
-		}
-
-		answer, directErr := resolveDNSOverUDPDirect(query, dnsServer)
+		// Packet-flow DNS is on the critical path for user-visible app
+		// navigation. YouTube Shorts creates fresh googlevideo hostnames on
+		// each swipe; trying carrier/SOCKS DNS first can burn the 5s SOCKS DNS
+		// timeout per uncached hostname before the fast resolver is attempted.
+		// The iOS tunnel settings exclude the configured resolver address from
+		// VPN routing, so direct UDP/TCP is the low-latency path. Keep SOCKS DNS
+		// only as a final fallback for networks where direct resolver access is
+		// blocked.
+		answer, directErr := packetFlowDNSResolveUDPDirect(query, dnsServer)
 		if isUsableDNSAnswer(answer, directErr) {
 			putCachedDNSAnswer(query, answer)
 			return answer, nil
 		}
 
-		answer, tcpErr := resolveDNSOverTCPDirectOnce(query, dnsServer)
+		answer, tcpErr := packetFlowDNSResolveTCPDirect(query, dnsServer)
 		if isUsableDNSAnswer(answer, tcpErr) {
 			putCachedDNSAnswer(query, answer)
 			return answer, nil
 		}
 
-		if carrierErr != nil {
-			return nil, carrierErr
+		answer, carrierErr := packetFlowDNSResolveTCPSocks(query, socksHost, socksPort, dnsServer)
+		if isUsableDNSAnswer(answer, carrierErr) {
+			putCachedDNSAnswer(query, answer)
+			return answer, nil
 		}
+
 		if directErr != nil {
 			return nil, directErr
 		}
 		if tcpErr != nil {
 			return nil, tcpErr
 		}
+		if carrierErr != nil {
+			return nil, carrierErr
+		}
 		return nil, errors.New("empty or synthetic dns answer")
 	})
 }
+
+var (
+	packetFlowDNSResolveUDPDirect = resolveDNSOverUDPDirect
+	packetFlowDNSResolveTCPDirect = resolveDNSOverTCPDirectOnce
+	packetFlowDNSResolveTCPSocks  = resolveDNSOverTCPViaSocksOnce
+)
 
 func isUsableDNSAnswer(answer []byte, err error) bool {
 	return err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer) && !isSyntheticDNSAnswer(answer)
