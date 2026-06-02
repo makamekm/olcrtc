@@ -1,6 +1,7 @@
 package mobile
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -125,6 +126,8 @@ type packetFlowReadWriter struct {
 	socksHost   string
 	socksPort   int
 	dnsServer   string
+	udpRejectMu sync.Mutex
+	udpReject   map[string]time.Time
 	inPackets   uint64
 	outPackets  uint64
 	dnsSeen     uint64
@@ -143,6 +146,7 @@ func newPacketFlowReadWriter(mtu int, socksHost string, socksPort int) *packetFl
 		socksHost: socksHost,
 		socksPort: socksPort,
 		dnsServer: dnsServer,
+		udpReject: map[string]time.Time{},
 	}
 }
 
@@ -181,12 +185,17 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 		return nil
 	}
 	if isIPv4UDP(packet) {
-		// iOS NEPacketTunnelFlow is sensitive to ICMP-unreachable storms from
-		// YouTube/Safari QUIC probes. DNS is answered above; other UDP is not
-		// supported by the TCP/SOCKS tunnel, so drop it silently and let the
-		// application fall back to TCP instead of feeding ICMP responses back into
-		// the packet flow.
+		// DNS is answered above. Other UDP is not supported by the TCP/SOCKS
+		// tunnel. A silent drop makes YouTube/iOS apps wait through QUIC retry
+		// timers and looks like a dead VPN, so return a rate-limited ICMP port
+		// unreachable per flow to force immediate TCP fallback without recreating
+		// the old ICMP storm problem.
 		atomic.AddUint64(&rw.udpDropped, 1)
+		if rw.shouldRejectUDP(packet) {
+			if resp, ok := buildIPv4ICMPPortUnreachable(packet); ok {
+				_ = rw.Respond(resp)
+			}
+		}
 		return nil
 	}
 	atomic.AddUint64(&rw.inPackets, 1)
@@ -235,6 +244,41 @@ func (rw *packetFlowReadWriter) ReadOutbound(timeout time.Duration) ([]byte, err
 
 func (rw *packetFlowReadWriter) Close() {
 	rw.once.Do(func() { close(rw.closed) })
+}
+
+func (rw *packetFlowReadWriter) shouldRejectUDP(packet []byte) bool {
+	key, ok := ipv4UDPFlowKey(packet)
+	if !ok {
+		return false
+	}
+	now := time.Now()
+	rw.udpRejectMu.Lock()
+	defer rw.udpRejectMu.Unlock()
+	if last, exists := rw.udpReject[key]; exists && now.Sub(last) < 5*time.Second {
+		return false
+	}
+	if len(rw.udpReject) > 4096 {
+		cutoff := now.Add(-30 * time.Second)
+		for flow, seen := range rw.udpReject {
+			if seen.Before(cutoff) {
+				delete(rw.udpReject, flow)
+			}
+		}
+	}
+	rw.udpReject[key] = now
+	return true
+}
+
+func ipv4UDPFlowKey(packet []byte) (string, bool) {
+	if !isIPv4UDP(packet) {
+		return "", false
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if len(packet) < ihl+8 {
+		return "", false
+	}
+	udp := packet[ihl:]
+	return fmt.Sprintf("%08x:%d>%08x:%d", binary.BigEndian.Uint32(packet[12:16]), binary.BigEndian.Uint16(udp[0:2]), binary.BigEndian.Uint32(packet[16:20]), binary.BigEndian.Uint16(udp[2:4])), true
 }
 
 func MobilePacketFlowDebugStats() string {

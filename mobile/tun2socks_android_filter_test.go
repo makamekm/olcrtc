@@ -87,7 +87,7 @@ func TestAndroidTunReadWriterRejectsNonDNSUDPWithICMP(t *testing.T) {
 	}
 }
 
-func TestPacketFlowReadWriterSilentlyDropsNonDNSUDP(t *testing.T) {
+func TestPacketFlowReadWriterRejectsNonDNSUDPWithRateLimitedICMP(t *testing.T) {
 	resetMobileGlobals(t)
 	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
 
@@ -103,11 +103,23 @@ func TestPacketFlowReadWriterSilentlyDropsNonDNSUDP(t *testing.T) {
 	}
 	select {
 	case got := <-rw.outbound:
-		t.Fatalf("unexpected outbound response for silently-dropped UDP len=%d proto=%d", len(got), got[9])
+		if got[9] != 1 || got[20] != 3 || got[21] != 3 {
+			t.Fatalf("response protocol/type/code = %d/%d/%d, want ICMP destination-port-unreachable", got[9], got[20], got[21])
+		}
+	default:
+		t.Fatal("missing ICMP unreachable response for non-DNS UDP")
+	}
+
+	if err := rw.Inject(packet); err != nil {
+		t.Fatalf("second Inject() error = %v", err)
+	}
+	select {
+	case got := <-rw.outbound:
+		t.Fatalf("unexpected second outbound response inside rate limit len=%d proto=%d", len(got), got[9])
 	default:
 	}
-	if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 1 {
-		t.Fatalf("udpDropped = %d, want 1", dropped)
+	if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 2 {
+		t.Fatalf("udpDropped = %d, want 2", dropped)
 	}
 	if in := atomic.LoadUint64(&rw.inPackets); in != 0 {
 		t.Fatalf("inPackets = %d, want 0", in)
