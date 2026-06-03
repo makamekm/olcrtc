@@ -15,6 +15,16 @@ import (
 const (
 	fallbackPacketFlowDNSServer = defaultDNSServer
 	packetFlowDNSAcquireTimeout = 10 * time.Second
+	packetFlowDNSSocksTimeout   = 1500 * time.Millisecond
+)
+
+type packetFlowDNSAnswerSource int
+
+const (
+	packetFlowDNSAnswerDirectUDP packetFlowDNSAnswerSource = iota + 1
+	packetFlowDNSAnswerDirectTCP
+	packetFlowDNSAnswerSocks
+	packetFlowDNSAnswerCache
 )
 
 var packetFlowDNSSemaphore = make(chan struct{}, 128)
@@ -53,12 +63,13 @@ func (rw *packetFlowReadWriter) tryHandleDNS(packet []byte) bool {
 		if dnsServer == "" {
 			dnsServer = fallbackPacketFlowDNSServer
 		}
-		resp, ok := buildDNSResponseViaTCP(packetCopy, rw.socksHost, rw.socksPort, dnsServer)
+		resp, source, ok := buildDNSResponseViaTCP(packetCopy, rw.socksHost, rw.socksPort, dnsServer)
 		if !ok || len(resp) == 0 {
 			atomic.AddUint64(&rw.dnsMiss, 1)
 			return
 		}
 		rw.countDNSAnswer(packetCopy, resp)
+		rw.countDNSAnswerSource(source)
 		atomic.AddUint64(&rw.dnsAnswered, 1)
 		_ = rw.Respond(resp)
 	}()
@@ -84,13 +95,13 @@ func isIPv4UDP53(packet []byte) bool {
 	return binary.BigEndian.Uint16(packet[ihl+2:ihl+4]) == 53
 }
 
-func buildDNSResponseViaTCP(packet []byte, socksHost string, socksPort int, dnsServer string) ([]byte, bool) {
+func buildDNSResponseViaTCP(packet []byte, socksHost string, socksPort int, dnsServer string) ([]byte, packetFlowDNSAnswerSource, bool) {
 	if len(packet) < 28 || packet[0]>>4 != 4 {
-		return nil, false
+		return nil, 0, false
 	}
 	ihl := int(packet[0]&0x0f) * 4
 	if ihl < 20 || len(packet) < ihl+8 || packet[9] != 17 {
-		return nil, false
+		return nil, 0, false
 	}
 	totalLen := int(binary.BigEndian.Uint16(packet[2:4]))
 	if totalLen <= 0 || totalLen > len(packet) {
@@ -100,16 +111,16 @@ func buildDNSResponseViaTCP(packet []byte, socksHost string, socksPort int, dnsS
 	srcPort := binary.BigEndian.Uint16(udp[0:2])
 	dstPort := binary.BigEndian.Uint16(udp[2:4])
 	if dstPort != 53 {
-		return nil, false
+		return nil, 0, false
 	}
 	udpLen := int(binary.BigEndian.Uint16(udp[4:6]))
 	if udpLen < 8 || len(udp) < udpLen {
-		return nil, false
+		return nil, 0, false
 	}
 	query := append([]byte(nil), udp[8:udpLen]...)
-	answer, err := resolveDNSOverTCPViaSocks(query, socksHost, socksPort, dnsServer)
+	answer, source, err := resolveDNSOverTCPViaSocks(query, socksHost, socksPort, dnsServer)
 	if err != nil || len(answer) == 0 {
-		return nil, false
+		return nil, 0, false
 	}
 
 	payloadLen := len(answer)
@@ -132,20 +143,20 @@ func buildDNSResponseViaTCP(packet []byte, socksHost string, socksPort int, dnsS
 	copy(outUDP[8:], answer)
 	binary.BigEndian.PutUint16(outUDP[6:8], 0)
 	binary.BigEndian.PutUint16(outUDP[6:8], udpChecksum(resp[12:16], resp[16:20], outUDP))
-	return resp, true
+	return resp, source, true
 }
 
-func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int, dnsServer string) ([]byte, error) {
+func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int, dnsServer string) ([]byte, packetFlowDNSAnswerSource, error) {
 	if cached, ok := getCachedDNSAnswer(query); ok {
-		return cached, nil
+		return cached, packetFlowDNSAnswerCache, nil
 	}
 	if dnsServer == "" {
 		dnsServer = fallbackPacketFlowDNSServer
 	}
 
-	return resolveDNSWithInflight(query, func() ([]byte, error) {
+	return resolveDNSWithInflight(query, func() ([]byte, packetFlowDNSAnswerSource, error) {
 		if cached, ok := getCachedDNSAnswer(query); ok {
-			return cached, nil
+			return cached, packetFlowDNSAnswerCache, nil
 		}
 
 		// Packet-flow DNS is on the critical path for user-visible app
@@ -159,31 +170,31 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int, dn
 		answer, directErr := packetFlowDNSResolveUDPDirect(query, dnsServer)
 		if isUsableDNSAnswer(answer, directErr) {
 			putCachedDNSAnswer(query, answer)
-			return answer, nil
+			return answer, packetFlowDNSAnswerDirectUDP, nil
 		}
 
 		answer, tcpErr := packetFlowDNSResolveTCPDirect(query, dnsServer)
 		if isUsableDNSAnswer(answer, tcpErr) {
 			putCachedDNSAnswer(query, answer)
-			return answer, nil
+			return answer, packetFlowDNSAnswerDirectTCP, nil
 		}
 
 		answer, carrierErr := packetFlowDNSResolveTCPSocks(query, socksHost, socksPort, dnsServer)
 		if isUsableDNSAnswer(answer, carrierErr) {
 			putCachedDNSAnswer(query, answer)
-			return answer, nil
+			return answer, packetFlowDNSAnswerSocks, nil
 		}
 
 		if directErr != nil {
-			return nil, directErr
+			return nil, 0, directErr
 		}
 		if tcpErr != nil {
-			return nil, tcpErr
+			return nil, 0, tcpErr
 		}
 		if carrierErr != nil {
-			return nil, carrierErr
+			return nil, 0, carrierErr
 		}
-		return nil, errors.New("empty or synthetic dns answer")
+		return nil, 0, errors.New("empty or synthetic dns answer")
 	})
 }
 
@@ -206,15 +217,15 @@ func isRetryableDNSResponse(answer []byte) bool {
 }
 
 func resolveDNSOverTCPViaSocksOnce(query []byte, socksHost string, socksPort int, dnsServer string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), packetFlowDNSSocksTimeout)
 	defer cancel()
-	dialer := net.Dialer{Timeout: 5 * time.Second}
+	dialer := net.Dialer{Timeout: packetFlowDNSSocksTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(socksHost, strconv.Itoa(socksPort)))
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(packetFlowDNSSocksTimeout))
 	if dnsServer == "" {
 		dnsServer = fallbackPacketFlowDNSServer
 	}

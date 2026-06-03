@@ -142,6 +142,10 @@ type packetFlowReadWriter struct {
 	dnsOther            uint64
 	dnsAWithIPv4        uint64
 	dnsAEmpty           uint64
+	dnsDirectUDP        uint64
+	dnsDirectTCP        uint64
+	dnsSocks            uint64
+	dnsCache            uint64
 	udpDropped          uint64
 }
 
@@ -296,6 +300,19 @@ func (rw *packetFlowReadWriter) countDNSAnswer(queryPacket []byte, responsePacke
 	atomic.AddUint64(&rw.dnsAWithIPv4, 1)
 }
 
+func (rw *packetFlowReadWriter) countDNSAnswerSource(source packetFlowDNSAnswerSource) {
+	switch source {
+	case packetFlowDNSAnswerDirectUDP:
+		atomic.AddUint64(&rw.dnsDirectUDP, 1)
+	case packetFlowDNSAnswerDirectTCP:
+		atomic.AddUint64(&rw.dnsDirectTCP, 1)
+	case packetFlowDNSAnswerSocks:
+		atomic.AddUint64(&rw.dnsSocks, 1)
+	case packetFlowDNSAnswerCache:
+		atomic.AddUint64(&rw.dnsCache, 1)
+	}
+}
+
 func dnsPayloadFromIPv4UDP(packet []byte) ([]byte, bool) {
 	if len(packet) < 28 || packet[0]>>4 != 4 {
 		return nil, false
@@ -376,5 +393,5 @@ func MobilePacketFlowDebugStats() string {
 	if rw == nil {
 		return "packetflow=stopped"
 	}
-	return fmt.Sprintf("packetflow=running in=%d out=%d udp_forwarded=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d udp_dropped=%d", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.udpForwarded), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.udpDropped))
+	return fmt.Sprintf("packetflow=running in=%d out=%d udp_forwarded=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d dns_direct_udp=%d dns_direct_tcp=%d dns_socks=%d dns_cache=%d udp_dropped=%d", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.udpForwarded), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.dnsDirectUDP), atomic.LoadUint64(&rw.dnsDirectTCP), atomic.LoadUint64(&rw.dnsSocks), atomic.LoadUint64(&rw.dnsCache), atomic.LoadUint64(&rw.udpDropped))
 }

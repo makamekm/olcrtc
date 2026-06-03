@@ -15,6 +15,7 @@ type packetFlowDNSCacheEntry struct {
 type packetFlowDNSInflightEntry struct {
 	done   chan struct{}
 	answer []byte
+	source packetFlowDNSAnswerSource
 	err    error
 }
 
@@ -75,7 +76,7 @@ func putCachedDNSAnswer(query, answer []byte) {
 	}
 }
 
-func resolveDNSWithInflight(query []byte, resolve func() ([]byte, error)) ([]byte, error) {
+func resolveDNSWithInflight(query []byte, resolve func() ([]byte, packetFlowDNSAnswerSource, error)) ([]byte, packetFlowDNSAnswerSource, error) {
 	key, ok := packetFlowDNSCacheKey(query)
 	if !ok {
 		return resolve()
@@ -90,14 +91,15 @@ func resolveDNSWithInflight(query []byte, resolve func() ([]byte, error)) ([]byt
 			answer[0] = query[0]
 			answer[1] = query[1]
 		}
-		return answer, entry.err
+		return answer, entry.source, entry.err
 	}
 	entry := &packetFlowDNSInflightEntry{done: make(chan struct{})}
 	packetFlowDNSInflight.entries[key] = entry
 	packetFlowDNSInflight.mu.Unlock()
 
-	answer, err := resolve()
+	answer, source, err := resolve()
 	entry.answer = append([]byte(nil), answer...)
+	entry.source = source
 	entry.err = err
 	close(entry.done)
 
@@ -110,7 +112,7 @@ func resolveDNSWithInflight(query []byte, resolve func() ([]byte, error)) ([]byt
 		answer[0] = query[0]
 		answer[1] = query[1]
 	}
-	return answer, err
+	return answer, source, err
 }
 
 func packetFlowDNSCacheKey(query []byte) (string, bool) {

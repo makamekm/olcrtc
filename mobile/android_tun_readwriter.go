@@ -127,7 +127,7 @@ func (rw *androidTunReadWriter) tryHandleDNS(packet []byte) bool {
 		if dnsServer == "" {
 			dnsServer = fallbackPacketFlowDNSServer
 		}
-		resp, ok := buildDNSResponseViaTCP(packetCopy, rw.socksHost, rw.socksPort, dnsServer)
+		resp, _, ok := buildDNSResponseViaTCP(packetCopy, rw.socksHost, rw.socksPort, dnsServer)
 		if !ok || len(resp) == 0 {
 			atomic.AddUint64(&rw.dnsMiss, 1)
 			if failure, failureOK := buildDNSFailureResponse(packetCopy); failureOK {

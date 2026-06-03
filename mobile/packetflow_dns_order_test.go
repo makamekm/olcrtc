@@ -37,7 +37,7 @@ func TestPacketFlowDNSPrefersDirectUDPBeforeCarrierSocks(t *testing.T) {
 		return nil, errors.New("socks should not run after usable udp answer")
 	}
 
-	answer, err := resolveDNSOverTCPViaSocks(query, "127.0.0.1", 10808, "9.9.9.9:53")
+	answer, _, err := resolveDNSOverTCPViaSocks(query, "127.0.0.1", 10808, "9.9.9.9:53")
 	if err != nil {
 		t.Fatalf("resolveDNSOverTCPViaSocks error = %v", err)
 	}
@@ -78,7 +78,7 @@ func TestPacketFlowDNSFallsBackToSocksAfterDirectFailures(t *testing.T) {
 		return socksAnswer, nil
 	}
 
-	answer, err := resolveDNSOverTCPViaSocks(query, "127.0.0.1", 10808, "9.9.9.9:53")
+	answer, _, err := resolveDNSOverTCPViaSocks(query, "127.0.0.1", 10808, "9.9.9.9:53")
 	if err != nil {
 		t.Fatalf("resolveDNSOverTCPViaSocks error = %v", err)
 	}
