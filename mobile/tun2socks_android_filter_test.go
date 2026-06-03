@@ -87,11 +87,44 @@ func TestAndroidTunReadWriterRejectsNonDNSUDPWithICMP(t *testing.T) {
 	}
 }
 
-func TestPacketFlowReadWriterRejectsNonDNSUDPWithRateLimitedICMP(t *testing.T) {
+func TestPacketFlowReadWriterRejectsMediaUDP443WithICMP(t *testing.T) {
 	resetMobileGlobals(t)
 	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
 
 	packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, 443, []byte("quic"))
+	if err := rw.Inject(packet); err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+
+	select {
+	case got := <-rw.inbound:
+		t.Fatalf("unexpected forwarded UDP/443 packet len=%d proto=%d", len(got), got[9])
+	default:
+	}
+	select {
+	case got := <-rw.outbound:
+		if got[9] != 1 || got[20] != 3 || got[21] != 3 {
+			t.Fatalf("response protocol/type/code = %d/%d/%d, want ICMP destination-port-unreachable", got[9], got[20], got[21])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing ICMP unreachable response for UDP/443")
+	}
+	if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 1 {
+		t.Fatalf("udpDropped = %d, want 1", dropped)
+	}
+	if forwarded := atomic.LoadUint64(&rw.udpForwarded); forwarded != 0 {
+		t.Fatalf("udpForwarded = %d, want 0", forwarded)
+	}
+	if in := atomic.LoadUint64(&rw.inPackets); in != 0 {
+		t.Fatalf("inPackets = %d, want 0", in)
+	}
+}
+
+func TestPacketFlowReadWriterRejectsNonMediaUDPWithRateLimitedICMP(t *testing.T) {
+	resetMobileGlobals(t)
+	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
+
+	packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, 123, []byte("ntp"))
 	if err := rw.Inject(packet); err != nil {
 		t.Fatalf("Inject() error = %v", err)
 	}
@@ -107,7 +140,7 @@ func TestPacketFlowReadWriterRejectsNonDNSUDPWithRateLimitedICMP(t *testing.T) {
 			t.Fatalf("response protocol/type/code = %d/%d/%d, want ICMP destination-port-unreachable", got[9], got[20], got[21])
 		}
 	case <-time.After(time.Second):
-		t.Fatal("missing ICMP unreachable response for non-DNS UDP")
+		t.Fatal("missing ICMP unreachable response for non-media UDP")
 	}
 
 	if err := rw.Inject(packet); err != nil {
@@ -115,7 +148,7 @@ func TestPacketFlowReadWriterRejectsNonDNSUDPWithRateLimitedICMP(t *testing.T) {
 	}
 	select {
 	case got := <-rw.outbound:
-		t.Fatalf("unexpected second outbound response inside rate limit len=%d proto=%d", len(got), got[9])
+		t.Fatalf("unexpected second outbound response inside per-flow rate limit len=%d proto=%d", len(got), got[9])
 	default:
 	}
 	if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 2 {
@@ -123,6 +156,40 @@ func TestPacketFlowReadWriterRejectsNonDNSUDPWithRateLimitedICMP(t *testing.T) {
 	}
 	if in := atomic.LoadUint64(&rw.inPackets); in != 0 {
 		t.Fatalf("inPackets = %d, want 0", in)
+	}
+}
+
+func TestPacketFlowReadWriterCapsUDPICMPFallbackBudget(t *testing.T) {
+	resetMobileGlobals(t)
+	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
+
+	for i := 0; i < 12; i++ {
+		packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, byte(i + 2)}, [4]byte{93, 184, 216, byte(34 + i)}, uint16(50000+i), 443, []byte("quic"))
+		if err := rw.Inject(packet); err != nil {
+			t.Fatalf("Inject(%d) error = %v", i, err)
+		}
+	}
+
+	icmpCount := 0
+	for {
+		select {
+		case got := <-rw.outbound:
+			if got[9] != 1 || got[20] != 3 || got[21] != 3 {
+				t.Fatalf("response protocol/type/code = %d/%d/%d, want ICMP destination-port-unreachable", got[9], got[20], got[21])
+			}
+			icmpCount++
+		default:
+			if icmpCount != 8 {
+				t.Fatalf("ICMP fallback responses = %d, want 8", icmpCount)
+			}
+			if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 12 {
+				t.Fatalf("udpDropped = %d, want 12", dropped)
+			}
+			if forwarded := atomic.LoadUint64(&rw.udpForwarded); forwarded != 0 {
+				t.Fatalf("udpForwarded = %d, want 0", forwarded)
+			}
+			return
+		}
 	}
 }
 

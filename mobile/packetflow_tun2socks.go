@@ -118,29 +118,31 @@ func MobileReadPacket(timeoutMillis int64) ([]byte, error) {
 }
 
 type packetFlowReadWriter struct {
-	inbound      chan []byte
-	outbound     chan []byte
-	closed       chan struct{}
-	once         sync.Once
-	mtu          int
-	socksHost    string
-	socksPort    int
-	dnsServer    string
-	udpRejectMu  sync.Mutex
-	udpReject    map[string]time.Time
-	inPackets    uint64
-	outPackets   uint64
-	dnsSeen      uint64
-	dnsAnswered  uint64
-	dnsMiss      uint64
-	dnsA         uint64
-	dnsAAAA      uint64
-	dnsHTTPS     uint64
-	dnsSVCB      uint64
-	dnsOther     uint64
-	dnsAWithIPv4 uint64
-	dnsAEmpty    uint64
-	udpDropped   uint64
+	inbound             chan []byte
+	outbound            chan []byte
+	closed              chan struct{}
+	once                sync.Once
+	mtu                 int
+	socksHost           string
+	socksPort           int
+	dnsServer           string
+	udpRejectMu         sync.Mutex
+	udpReject           map[string]time.Time
+	udpRejectICMPBudget uint64
+	inPackets           uint64
+	outPackets          uint64
+	udpForwarded        uint64
+	dnsSeen             uint64
+	dnsAnswered         uint64
+	dnsMiss             uint64
+	dnsA                uint64
+	dnsAAAA             uint64
+	dnsHTTPS            uint64
+	dnsSVCB             uint64
+	dnsOther            uint64
+	dnsAWithIPv4        uint64
+	dnsAEmpty           uint64
+	udpDropped          uint64
 }
 
 func newPacketFlowReadWriter(mtu int, socksHost string, socksPort int) *packetFlowReadWriter {
@@ -191,19 +193,27 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 	if rw.tryHandleDNS(packet) {
 		return nil
 	}
-	if isIPv4UDP(packet) {
-		// DNS is answered above. Other UDP is not supported by the TCP/SOCKS
-		// tunnel. A silent drop makes YouTube/iOS apps wait through QUIC retry
-		// timers and looks like a dead VPN, so return a rate-limited ICMP port
-		// unreachable per flow to force immediate TCP fallback without recreating
-		// the old ICMP storm problem.
+	if isIPv4UDP(packet) && !rw.shouldForwardUDP(packet) {
+		// DNS is answered above. Non-DNS UDP is intentionally rejected in the
+		// iOS packet-flow bridge. Forwarding QUIC/media UDP/443 through SOCKS5
+		// UDP ASSOCIATE looks like activity in PacketTunnel counters but leaves
+		// real YouTube stuck on feed/player loading on current RUPN transports.
+		// Emit only a tiny global ICMP budget as a fallback hint. YouTube opens
+		// many UDP/443 flows; responding to every first-flow packet creates an
+		// outbound ICMP storm in the PacketTunnel and can get the NetworkExtension
+		// silently evicted under iOS memory pressure. After the budget is spent,
+		// drop/count only; TCP/HTTPS fallback still happens without keeping the
+		// provider busy generating synthetic packets.
 		atomic.AddUint64(&rw.udpDropped, 1)
-		if rw.shouldRejectUDP(packet) {
+		if rw.shouldRejectUDP(packet) && atomic.AddUint64(&rw.udpRejectICMPBudget, 1) <= 8 {
 			if resp, ok := buildIPv4ICMPPortUnreachable(packet); ok {
 				_ = rw.Respond(resp)
 			}
 		}
 		return nil
+	}
+	if isIPv4UDP(packet) {
+		atomic.AddUint64(&rw.udpForwarded, 1)
 	}
 	atomic.AddUint64(&rw.inPackets, 1)
 	copyPacket := append([]byte(nil), packet...)
@@ -309,6 +319,10 @@ func dnsPayloadFromIPv4UDP(packet []byte) ([]byte, bool) {
 	return udp[8:udpLen], true
 }
 
+func (rw *packetFlowReadWriter) shouldForwardUDP(packet []byte) bool {
+	return false
+}
+
 func (rw *packetFlowReadWriter) shouldRejectUDP(packet []byte) bool {
 	key, ok := ipv4UDPFlowKey(packet)
 	if !ok {
@@ -362,5 +376,5 @@ func MobilePacketFlowDebugStats() string {
 	if rw == nil {
 		return "packetflow=stopped"
 	}
-	return fmt.Sprintf("packetflow=running in=%d out=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d udp_dropped=%d", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.udpDropped))
+	return fmt.Sprintf("packetflow=running in=%d out=%d udp_forwarded=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d udp_dropped=%d", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.udpForwarded), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.udpDropped))
 }
