@@ -162,9 +162,16 @@ func TestPacketFlowReadWriterRejectsNonMediaUDPWithRateLimitedICMP(t *testing.T)
 func TestPacketFlowReadWriterCapsUDPICMPFallbackBudget(t *testing.T) {
 	resetMobileGlobals(t)
 	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
+	totalFlows := packetFlowUDPICMPRejectBudget + 4
 
-	for i := 0; i < 12; i++ {
-		packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, byte(i + 2)}, [4]byte{93, 184, 216, byte(34 + i)}, uint16(50000+i), 443, []byte("quic"))
+	for i := 0; i < totalFlows; i++ {
+		packet := buildTestIPv4UDPPacket(
+			[4]byte{10, 8, byte(i / 200), byte(i + 2)},
+			[4]byte{93, 184, byte(i / 200), byte(34 + i)},
+			uint16(30000+i),
+			443,
+			[]byte("quic"),
+		)
 		if err := rw.Inject(packet); err != nil {
 			t.Fatalf("Inject(%d) error = %v", i, err)
 		}
@@ -179,11 +186,14 @@ func TestPacketFlowReadWriterCapsUDPICMPFallbackBudget(t *testing.T) {
 			}
 			icmpCount++
 		default:
-			if icmpCount != 8 {
-				t.Fatalf("ICMP fallback responses = %d, want 8", icmpCount)
+			if icmpCount != packetFlowUDPICMPRejectBudget {
+				t.Fatalf("ICMP fallback responses = %d, want %d", icmpCount, packetFlowUDPICMPRejectBudget)
 			}
-			if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 12 {
-				t.Fatalf("udpDropped = %d, want 12", dropped)
+			if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != uint64(totalFlows) {
+				t.Fatalf("udpDropped = %d, want %d", dropped, totalFlows)
+			}
+			if rejected := atomic.LoadUint64(&rw.udpICMPRejected); rejected != uint64(packetFlowUDPICMPRejectBudget) {
+				t.Fatalf("udpICMPRejected = %d, want %d", rejected, packetFlowUDPICMPRejectBudget)
 			}
 			if forwarded := atomic.LoadUint64(&rw.udpForwarded); forwarded != 0 {
 				t.Fatalf("udpForwarded = %d, want 0", forwarded)

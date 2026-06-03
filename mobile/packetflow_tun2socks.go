@@ -117,6 +117,8 @@ func MobileReadPacket(timeoutMillis int64) ([]byte, error) {
 	return rw.ReadOutbound(time.Duration(timeoutMillis) * time.Millisecond)
 }
 
+const packetFlowUDPICMPRejectBudget = 256
+
 type packetFlowReadWriter struct {
 	inbound             chan []byte
 	outbound            chan []byte
@@ -129,6 +131,7 @@ type packetFlowReadWriter struct {
 	udpRejectMu         sync.Mutex
 	udpReject           map[string]time.Time
 	udpRejectICMPBudget uint64
+	udpICMPRejected     uint64
 	inPackets           uint64
 	outPackets          uint64
 	udpForwarded        uint64
@@ -202,16 +205,16 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 		// iOS packet-flow bridge. Forwarding QUIC/media UDP/443 through SOCKS5
 		// UDP ASSOCIATE looks like activity in PacketTunnel counters but leaves
 		// real YouTube stuck on feed/player loading on current RUPN transports.
-		// Emit only a tiny global ICMP budget as a fallback hint. YouTube opens
-		// many UDP/443 flows; responding to every first-flow packet creates an
-		// outbound ICMP storm in the PacketTunnel and can get the NetworkExtension
-		// silently evicted under iOS memory pressure. After the budget is spent,
-		// drop/count only; TCP/HTTPS fallback still happens without keeping the
-		// provider busy generating synthetic packets.
+		// YouTube opens many UDP/443 flows. A tiny global ICMP budget is not
+		// enough to push the app/browser off QUIC, so allow a bounded burst of
+		// first-flow ICMP rejects and then drop/count only to avoid an unbounded
+		// PacketTunnel outbound storm.
 		atomic.AddUint64(&rw.udpDropped, 1)
-		if rw.shouldRejectUDP(packet) && atomic.AddUint64(&rw.udpRejectICMPBudget, 1) <= 8 {
+		if rw.shouldRejectUDP(packet) && atomic.AddUint64(&rw.udpRejectICMPBudget, 1) <= packetFlowUDPICMPRejectBudget {
 			if resp, ok := buildIPv4ICMPPortUnreachable(packet); ok {
-				_ = rw.Respond(resp)
+				if rw.Respond(resp) == nil {
+					atomic.AddUint64(&rw.udpICMPRejected, 1)
+				}
 			}
 		}
 		return nil
@@ -393,5 +396,5 @@ func MobilePacketFlowDebugStats() string {
 	if rw == nil {
 		return "packetflow=stopped"
 	}
-	return fmt.Sprintf("packetflow=running in=%d out=%d udp_forwarded=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d dns_direct_udp=%d dns_direct_tcp=%d dns_socks=%d dns_cache=%d udp_dropped=%d", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.udpForwarded), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.dnsDirectUDP), atomic.LoadUint64(&rw.dnsDirectTCP), atomic.LoadUint64(&rw.dnsSocks), atomic.LoadUint64(&rw.dnsCache), atomic.LoadUint64(&rw.udpDropped))
+	return fmt.Sprintf("packetflow=running in=%d out=%d udp_forwarded=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d dns_direct_udp=%d dns_direct_tcp=%d dns_socks=%d dns_cache=%d udp_dropped=%d udp_icmp_rejected=%d", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.udpForwarded), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.dnsDirectUDP), atomic.LoadUint64(&rw.dnsDirectTCP), atomic.LoadUint64(&rw.dnsSocks), atomic.LoadUint64(&rw.dnsCache), atomic.LoadUint64(&rw.udpDropped), atomic.LoadUint64(&rw.udpICMPRejected))
 }
