@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	olclient "github.com/openlibrecommunity/olcrtc/internal/client"
 	"github.com/xjasonlyu/tun2socks/v2/core"
 	"github.com/xjasonlyu/tun2socks/v2/core/device/iobased"
 	"github.com/xjasonlyu/tun2socks/v2/proxy"
@@ -117,39 +118,43 @@ func MobileReadPacket(timeoutMillis int64) ([]byte, error) {
 	return rw.ReadOutbound(time.Duration(timeoutMillis) * time.Millisecond)
 }
 
-const packetFlowUDPICMPRejectBudget = 256
+const (
+	packetFlowUDPICMPRejectWindow      = time.Second
+	packetFlowUDPICMPRejectWindowLimit = 512
+)
 
 type packetFlowReadWriter struct {
-	inbound             chan []byte
-	outbound            chan []byte
-	closed              chan struct{}
-	once                sync.Once
-	mtu                 int
-	socksHost           string
-	socksPort           int
-	dnsServer           string
-	udpRejectMu         sync.Mutex
-	udpReject           map[string]time.Time
-	udpRejectICMPBudget uint64
-	udpICMPRejected     uint64
-	inPackets           uint64
-	outPackets          uint64
-	udpForwarded        uint64
-	dnsSeen             uint64
-	dnsAnswered         uint64
-	dnsMiss             uint64
-	dnsA                uint64
-	dnsAAAA             uint64
-	dnsHTTPS            uint64
-	dnsSVCB             uint64
-	dnsOther            uint64
-	dnsAWithIPv4        uint64
-	dnsAEmpty           uint64
-	dnsDirectUDP        uint64
-	dnsDirectTCP        uint64
-	dnsSocks            uint64
-	dnsCache            uint64
-	udpDropped          uint64
+	inbound              chan []byte
+	outbound             chan []byte
+	closed               chan struct{}
+	once                 sync.Once
+	mtu                  int
+	socksHost            string
+	socksPort            int
+	dnsServer            string
+	udpRejectMu          sync.Mutex
+	udpRejectWindowStart time.Time
+	udpRejectWindowCount int
+	udpICMPRejected      uint64
+	udpICMPSilent        uint64
+	inPackets            uint64
+	outPackets           uint64
+	udpForwarded         uint64
+	dnsSeen              uint64
+	dnsAnswered          uint64
+	dnsMiss              uint64
+	dnsA                 uint64
+	dnsAAAA              uint64
+	dnsHTTPS             uint64
+	dnsSVCB              uint64
+	dnsOther             uint64
+	dnsAWithIPv4         uint64
+	dnsAEmpty            uint64
+	dnsDirectUDP         uint64
+	dnsDirectTCP         uint64
+	dnsSocks             uint64
+	dnsCache             uint64
+	udpDropped           uint64
 }
 
 func newPacketFlowReadWriter(mtu int, socksHost string, socksPort int) *packetFlowReadWriter {
@@ -162,7 +167,6 @@ func newPacketFlowReadWriter(mtu int, socksHost string, socksPort int) *packetFl
 		socksHost: socksHost,
 		socksPort: socksPort,
 		dnsServer: dnsServer,
-		udpReject: map[string]time.Time{},
 	}
 }
 
@@ -205,17 +209,19 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 		// iOS packet-flow bridge. Forwarding QUIC/media UDP/443 through SOCKS5
 		// UDP ASSOCIATE looks like activity in PacketTunnel counters but leaves
 		// real YouTube stuck on feed/player loading on current RUPN transports.
-		// YouTube opens many UDP/443 flows. A tiny global ICMP budget is not
-		// enough to push the app/browser off QUIC, so allow a bounded burst of
-		// first-flow ICMP rejects and then drop/count only to avoid an unbounded
-		// PacketTunnel outbound storm.
+		// YouTube repeats UDP/443 packets while probing QUIC. A lifetime budget
+		// or per-flow cooldown turns those repeats into a silent blackhole, so
+		// reply with ICMP port-unreachable for every rejected UDP packet while a
+		// replenishing global window keeps the PacketTunnel outbound queue safe.
 		atomic.AddUint64(&rw.udpDropped, 1)
-		if rw.shouldRejectUDP(packet) && atomic.AddUint64(&rw.udpRejectICMPBudget, 1) <= packetFlowUDPICMPRejectBudget {
+		if rw.shouldRejectUDP(packet) {
 			if resp, ok := buildIPv4ICMPPortUnreachable(packet); ok {
 				if rw.Respond(resp) == nil {
 					atomic.AddUint64(&rw.udpICMPRejected, 1)
 				}
 			}
+		} else {
+			atomic.AddUint64(&rw.udpICMPSilent, 1)
 		}
 		return nil
 	}
@@ -344,38 +350,21 @@ func (rw *packetFlowReadWriter) shouldForwardUDP(packet []byte) bool {
 }
 
 func (rw *packetFlowReadWriter) shouldRejectUDP(packet []byte) bool {
-	key, ok := ipv4UDPFlowKey(packet)
-	if !ok {
+	if !isIPv4UDP(packet) {
 		return false
 	}
 	now := time.Now()
 	rw.udpRejectMu.Lock()
 	defer rw.udpRejectMu.Unlock()
-	if last, exists := rw.udpReject[key]; exists && now.Sub(last) < 5*time.Second {
+	if rw.udpRejectWindowStart.IsZero() || now.Sub(rw.udpRejectWindowStart) >= packetFlowUDPICMPRejectWindow {
+		rw.udpRejectWindowStart = now
+		rw.udpRejectWindowCount = 0
+	}
+	if rw.udpRejectWindowCount >= packetFlowUDPICMPRejectWindowLimit {
 		return false
 	}
-	if len(rw.udpReject) > 4096 {
-		cutoff := now.Add(-30 * time.Second)
-		for flow, seen := range rw.udpReject {
-			if seen.Before(cutoff) {
-				delete(rw.udpReject, flow)
-			}
-		}
-	}
-	rw.udpReject[key] = now
+	rw.udpRejectWindowCount++
 	return true
-}
-
-func ipv4UDPFlowKey(packet []byte) (string, bool) {
-	if !isIPv4UDP(packet) {
-		return "", false
-	}
-	ihl := int(packet[0]&0x0f) * 4
-	if len(packet) < ihl+8 {
-		return "", false
-	}
-	udp := packet[ihl:]
-	return fmt.Sprintf("%08x:%d>%08x:%d", binary.BigEndian.Uint32(packet[12:16]), binary.BigEndian.Uint16(udp[0:2]), binary.BigEndian.Uint32(packet[16:20]), binary.BigEndian.Uint16(udp[2:4])), true
 }
 
 func isIPv4UDPDstPort(packet []byte, port uint16) bool {
@@ -396,5 +385,5 @@ func MobilePacketFlowDebugStats() string {
 	if rw == nil {
 		return "packetflow=stopped"
 	}
-	return fmt.Sprintf("packetflow=running in=%d out=%d udp_forwarded=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d dns_direct_udp=%d dns_direct_tcp=%d dns_socks=%d dns_cache=%d udp_dropped=%d udp_icmp_rejected=%d", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.udpForwarded), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.dnsDirectUDP), atomic.LoadUint64(&rw.dnsDirectTCP), atomic.LoadUint64(&rw.dnsSocks), atomic.LoadUint64(&rw.dnsCache), atomic.LoadUint64(&rw.udpDropped), atomic.LoadUint64(&rw.udpICMPRejected))
+	return fmt.Sprintf("packetflow=running in=%d out=%d udp_forwarded=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d dns_direct_udp=%d dns_direct_tcp=%d dns_socks=%d dns_cache=%d udp_dropped=%d udp_icmp_rejected=%d udp_icmp_silent=%d %s", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.udpForwarded), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.dnsDirectUDP), atomic.LoadUint64(&rw.dnsDirectTCP), atomic.LoadUint64(&rw.dnsSocks), atomic.LoadUint64(&rw.dnsCache), atomic.LoadUint64(&rw.udpDropped), atomic.LoadUint64(&rw.udpICMPRejected), atomic.LoadUint64(&rw.udpICMPSilent), olclient.UDPRelayDebugStats())
 }

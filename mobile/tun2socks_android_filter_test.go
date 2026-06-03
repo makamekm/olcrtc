@@ -120,13 +120,15 @@ func TestPacketFlowReadWriterRejectsMediaUDP443WithICMP(t *testing.T) {
 	}
 }
 
-func TestPacketFlowReadWriterRejectsNonMediaUDPWithRateLimitedICMP(t *testing.T) {
+func TestPacketFlowReadWriterRejectsRepeatedNonDNSUDPWithICMP(t *testing.T) {
 	resetMobileGlobals(t)
 	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
 
 	packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, 123, []byte("ntp"))
-	if err := rw.Inject(packet); err != nil {
-		t.Fatalf("Inject() error = %v", err)
+	for i := 0; i < 2; i++ {
+		if err := rw.Inject(packet); err != nil {
+			t.Fatalf("Inject(%d) error = %v", i, err)
+		}
 	}
 
 	select {
@@ -134,49 +136,76 @@ func TestPacketFlowReadWriterRejectsNonMediaUDPWithRateLimitedICMP(t *testing.T)
 		t.Fatalf("unexpected forwarded UDP packet len=%d proto=%d", len(got), got[9])
 	default:
 	}
-	select {
-	case got := <-rw.outbound:
-		if got[9] != 1 || got[20] != 3 || got[21] != 3 {
-			t.Fatalf("response protocol/type/code = %d/%d/%d, want ICMP destination-port-unreachable", got[9], got[20], got[21])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("missing ICMP unreachable response for non-media UDP")
-	}
-
-	if err := rw.Inject(packet); err != nil {
-		t.Fatalf("second Inject() error = %v", err)
-	}
-	select {
-	case got := <-rw.outbound:
-		t.Fatalf("unexpected second outbound response inside per-flow rate limit len=%d proto=%d", len(got), got[9])
-	default:
+	if icmpCount := drainICMPResponses(t, rw); icmpCount != 2 {
+		t.Fatalf("ICMP responses for repeated UDP packets = %d, want 2", icmpCount)
 	}
 	if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != 2 {
 		t.Fatalf("udpDropped = %d, want 2", dropped)
+	}
+	if silent := atomic.LoadUint64(&rw.udpICMPSilent); silent != 0 {
+		t.Fatalf("udpICMPSilent = %d, want 0", silent)
 	}
 	if in := atomic.LoadUint64(&rw.inPackets); in != 0 {
 		t.Fatalf("inPackets = %d, want 0", in)
 	}
 }
 
-func TestPacketFlowReadWriterCapsUDPICMPFallbackBudget(t *testing.T) {
+func TestPacketFlowReadWriterRateLimitsUDPICMPFallbackPerWindow(t *testing.T) {
 	resetMobileGlobals(t)
 	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
-	totalFlows := packetFlowUDPICMPRejectBudget + 4
+	totalFlows := packetFlowUDPICMPRejectWindowLimit + 4
 
-	for i := 0; i < totalFlows; i++ {
+	injectUniqueUDPFlows(t, rw, 0, totalFlows)
+
+	icmpCount := drainICMPResponses(t, rw)
+	if icmpCount != packetFlowUDPICMPRejectWindowLimit {
+		t.Fatalf("first-window ICMP fallback responses = %d, want %d", icmpCount, packetFlowUDPICMPRejectWindowLimit)
+	}
+	if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != uint64(totalFlows) {
+		t.Fatalf("udpDropped = %d, want %d", dropped, totalFlows)
+	}
+	if rejected := atomic.LoadUint64(&rw.udpICMPRejected); rejected != uint64(packetFlowUDPICMPRejectWindowLimit) {
+		t.Fatalf("udpICMPRejected = %d, want %d", rejected, packetFlowUDPICMPRejectWindowLimit)
+	}
+	if silent := atomic.LoadUint64(&rw.udpICMPSilent); silent != uint64(totalFlows-packetFlowUDPICMPRejectWindowLimit) {
+		t.Fatalf("udpICMPSilent = %d, want %d", silent, totalFlows-packetFlowUDPICMPRejectWindowLimit)
+	}
+
+	rw.udpRejectMu.Lock()
+	rw.udpRejectWindowStart = time.Now().Add(-packetFlowUDPICMPRejectWindow)
+	rw.udpRejectMu.Unlock()
+	injectUniqueUDPFlows(t, rw, 1000, 3)
+
+	icmpCount = drainICMPResponses(t, rw)
+	if icmpCount != 3 {
+		t.Fatalf("next-window ICMP fallback responses = %d, want 3", icmpCount)
+	}
+	if rejected := atomic.LoadUint64(&rw.udpICMPRejected); rejected != uint64(packetFlowUDPICMPRejectWindowLimit+3) {
+		t.Fatalf("udpICMPRejected after replenish = %d, want %d", rejected, packetFlowUDPICMPRejectWindowLimit+3)
+	}
+	if forwarded := atomic.LoadUint64(&rw.udpForwarded); forwarded != 0 {
+		t.Fatalf("udpForwarded = %d, want 0", forwarded)
+	}
+}
+
+func injectUniqueUDPFlows(t *testing.T, rw *packetFlowReadWriter, start, count int) {
+	t.Helper()
+	for i := start; i < start+count; i++ {
 		packet := buildTestIPv4UDPPacket(
 			[4]byte{10, 8, byte(i / 200), byte(i + 2)},
 			[4]byte{93, 184, byte(i / 200), byte(34 + i)},
 			uint16(30000+i),
-			443,
-			[]byte("quic"),
+			123,
+			[]byte("ntp"),
 		)
 		if err := rw.Inject(packet); err != nil {
 			t.Fatalf("Inject(%d) error = %v", i, err)
 		}
 	}
+}
 
+func drainICMPResponses(t *testing.T, rw *packetFlowReadWriter) int {
+	t.Helper()
 	icmpCount := 0
 	for {
 		select {
@@ -186,19 +215,7 @@ func TestPacketFlowReadWriterCapsUDPICMPFallbackBudget(t *testing.T) {
 			}
 			icmpCount++
 		default:
-			if icmpCount != packetFlowUDPICMPRejectBudget {
-				t.Fatalf("ICMP fallback responses = %d, want %d", icmpCount, packetFlowUDPICMPRejectBudget)
-			}
-			if dropped := atomic.LoadUint64(&rw.udpDropped); dropped != uint64(totalFlows) {
-				t.Fatalf("udpDropped = %d, want %d", dropped, totalFlows)
-			}
-			if rejected := atomic.LoadUint64(&rw.udpICMPRejected); rejected != uint64(packetFlowUDPICMPRejectBudget) {
-				t.Fatalf("udpICMPRejected = %d, want %d", rejected, packetFlowUDPICMPRejectBudget)
-			}
-			if forwarded := atomic.LoadUint64(&rw.udpForwarded); forwarded != 0 {
-				t.Fatalf("udpForwarded = %d, want 0", forwarded)
-			}
-			return
+			return icmpCount
 		}
 	}
 }

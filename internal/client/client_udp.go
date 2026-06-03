@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
@@ -15,6 +16,28 @@ import (
 
 const udpRelayIdleTimeout = 30 * time.Second
 const udpRelayMaxClientAddrs = 8
+
+var udpRelayStats udpRelayDebugStats
+
+type udpRelayDebugStats struct {
+	opens      atomic.Uint64
+	openFailed atomic.Uint64
+	sent       atomic.Uint64
+	sendFailed atomic.Uint64
+	received   atomic.Uint64
+	recvEnded  atomic.Uint64
+}
+
+func recordUDPRelayOpen()       { udpRelayStats.opens.Add(1) }
+func recordUDPRelayOpenFailed() { udpRelayStats.openFailed.Add(1) }
+func recordUDPRelaySent()       { udpRelayStats.sent.Add(1) }
+func recordUDPRelaySendFailed() { udpRelayStats.sendFailed.Add(1) }
+func recordUDPRelayReceived()   { udpRelayStats.received.Add(1) }
+func recordUDPRelayRecvEnded()  { udpRelayStats.recvEnded.Add(1) }
+
+func UDPRelayDebugStats() string {
+	return fmt.Sprintf("udp_relay_open=%d udp_relay_open_failed=%d udp_relay_sent=%d udp_relay_send_failed=%d udp_relay_received=%d udp_relay_recv_ended=%d", udpRelayStats.opens.Load(), udpRelayStats.openFailed.Load(), udpRelayStats.sent.Load(), udpRelayStats.sendFailed.Load(), udpRelayStats.received.Load(), udpRelayStats.recvEnded.Load())
+}
 
 type udpRelaySession struct {
 	key         string
@@ -97,6 +120,7 @@ func (c *Client) handleUDPAssociate(control net.Conn) {
 		if relay == nil || relay.IsClosed() {
 			relay, err = c.openUDPRelay(udpConn, clientAddr, key, targetAddr, targetPort, closeRelay)
 			if err != nil {
+				recordUDPRelayOpenFailed()
 				logger.Warnf("udp relay open %s:%d failed: %v", targetAddr, targetPort, err)
 				relaysMu.Unlock()
 				continue
@@ -108,6 +132,7 @@ func (c *Client) handleUDPAssociate(control net.Conn) {
 		relaysMu.Unlock()
 
 		if err := relay.Send(payload); err != nil {
+			recordUDPRelaySendFailed()
 			logger.Warnf("udp relay send %s failed: %v", key, err)
 			relay.Close()
 		}
@@ -161,6 +186,7 @@ func (c *Client) openUDPRelay(udpConn *net.UDPConn, clientAddr *net.UDPAddr, key
 	}
 	relay.UpdateClientAddr(clientAddr)
 	go relay.ReadLoop()
+	recordUDPRelayOpen()
 	logger.Debugf("udp relay open %s target=%s:%d", key, targetAddr, targetPort)
 	return relay, nil
 }
@@ -179,6 +205,9 @@ func (r *udpRelaySession) Send(payload []byte) error {
 	_ = r.stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	logger.Debugf("udp relay send %s bytes=%d", r.key, len(payload))
 	err := writeLengthPrefixedDatagram(r.stream, payload)
+	if err == nil {
+		recordUDPRelaySent()
+	}
 	_ = r.stream.SetWriteDeadline(time.Time{})
 	return err
 }
@@ -207,11 +236,13 @@ func (r *udpRelaySession) ReadLoop() {
 		_ = r.stream.SetReadDeadline(time.Now().Add(udpRelayIdleTimeout))
 		response, err := readLengthPrefixedDatagram(r.stream, 65535)
 		if err != nil || len(response) == 0 {
+			recordUDPRelayRecvEnded()
 			if err != nil && !errors.Is(err, io.EOF) {
 				logger.Debugf("udp relay recv %s ended: bytes=%d err=%v", r.key, len(response), err)
 			}
 			return
 		}
+		recordUDPRelayReceived()
 		logger.Debugf("udp relay recv %s bytes=%d", r.key, len(response))
 		packet := buildSocksUDPDatagram(r.targetAddr, r.targetPort, response)
 		r.mu.Lock()
