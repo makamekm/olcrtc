@@ -118,35 +118,43 @@ func MobileReadPacket(timeoutMillis int64) ([]byte, error) {
 	return rw.ReadOutbound(time.Duration(timeoutMillis) * time.Millisecond)
 }
 
+const (
+	packetFlowUDPICMPRejectWindow      = time.Second
+	packetFlowUDPICMPRejectWindowLimit = 512
+)
+
 type packetFlowReadWriter struct {
-	inbound         chan []byte
-	outbound        chan []byte
-	closed          chan struct{}
-	once            sync.Once
-	mtu             int
-	socksHost       string
-	socksPort       int
-	dnsServer       string
-	udpICMPRejected uint64
-	udpICMPSilent   uint64
-	inPackets       uint64
-	outPackets      uint64
-	udpForwarded    uint64
-	dnsSeen         uint64
-	dnsAnswered     uint64
-	dnsMiss         uint64
-	dnsA            uint64
-	dnsAAAA         uint64
-	dnsHTTPS        uint64
-	dnsSVCB         uint64
-	dnsOther        uint64
-	dnsAWithIPv4    uint64
-	dnsAEmpty       uint64
-	dnsDirectUDP    uint64
-	dnsDirectTCP    uint64
-	dnsSocks        uint64
-	dnsCache        uint64
-	udpDropped      uint64
+	inbound              chan []byte
+	outbound             chan []byte
+	closed               chan struct{}
+	once                 sync.Once
+	mtu                  int
+	socksHost            string
+	socksPort            int
+	dnsServer            string
+	udpRejectMu          sync.Mutex
+	udpRejectWindowStart time.Time
+	udpRejectWindowCount int
+	udpICMPRejected      uint64
+	udpICMPSilent        uint64
+	inPackets            uint64
+	outPackets           uint64
+	udpForwarded         uint64
+	dnsSeen              uint64
+	dnsAnswered          uint64
+	dnsMiss              uint64
+	dnsA                 uint64
+	dnsAAAA              uint64
+	dnsHTTPS             uint64
+	dnsSVCB              uint64
+	dnsOther             uint64
+	dnsAWithIPv4         uint64
+	dnsAEmpty            uint64
+	dnsDirectUDP         uint64
+	dnsDirectTCP         uint64
+	dnsSocks             uint64
+	dnsCache             uint64
+	udpDropped           uint64
 }
 
 func newPacketFlowReadWriter(mtu int, socksHost string, socksPort int) *packetFlowReadWriter {
@@ -197,14 +205,24 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 		return nil
 	}
 	if isIPv4UDP(packet) && !rw.shouldForwardUDP(packet) {
-		// DNS is answered above. Non-DNS UDP is intentionally dropped in the
-		// iOS packet-flow bridge. Forwarding QUIC/media UDP through SOCKS5 UDP
-		// ASSOCIATE is unsupported on current RUPN transports; generating ICMP
-		// replies for every YouTube/Safari QUIC probe also floods PacketFlow's
-		// outbound side and destabilizes HTTPS fallback on iOS. Silent drop keeps
-		// tun2socks TCP egress healthy while TCP fallback completes.
+		// DNS is answered above. Non-DNS UDP is intentionally rejected in the
+		// iOS packet-flow bridge. Forwarding QUIC/media UDP/443 through SOCKS5
+		// UDP ASSOCIATE looks like activity in PacketTunnel counters but leaves
+		// real YouTube stuck on feed/player loading on current RUPN transports.
+		// YouTube repeats UDP/443 packets while probing QUIC. A lifetime budget
+		// or per-flow cooldown turns those repeats into a silent blackhole, so
+		// reply with ICMP port-unreachable for every rejected UDP packet while a
+		// replenishing global window keeps the PacketTunnel outbound queue safe.
 		atomic.AddUint64(&rw.udpDropped, 1)
-		atomic.AddUint64(&rw.udpICMPSilent, 1)
+		if rw.shouldRejectUDP(packet) {
+			if resp, ok := buildIPv4ICMPPortUnreachable(packet); ok {
+				if rw.Respond(resp) == nil {
+					atomic.AddUint64(&rw.udpICMPRejected, 1)
+				}
+			}
+		} else {
+			atomic.AddUint64(&rw.udpICMPSilent, 1)
+		}
 		return nil
 	}
 	if isIPv4UDP(packet) {
@@ -329,6 +347,35 @@ func dnsPayloadFromIPv4UDP(packet []byte) ([]byte, bool) {
 
 func (rw *packetFlowReadWriter) shouldForwardUDP(packet []byte) bool {
 	return false
+}
+
+func (rw *packetFlowReadWriter) shouldRejectUDP(packet []byte) bool {
+	if !isIPv4UDP(packet) {
+		return false
+	}
+	now := time.Now()
+	rw.udpRejectMu.Lock()
+	defer rw.udpRejectMu.Unlock()
+	if rw.udpRejectWindowStart.IsZero() || now.Sub(rw.udpRejectWindowStart) >= packetFlowUDPICMPRejectWindow {
+		rw.udpRejectWindowStart = now
+		rw.udpRejectWindowCount = 0
+	}
+	if rw.udpRejectWindowCount >= packetFlowUDPICMPRejectWindowLimit {
+		return false
+	}
+	rw.udpRejectWindowCount++
+	return true
+}
+
+func isIPv4UDPDstPort(packet []byte, port uint16) bool {
+	if !isIPv4UDP(packet) {
+		return false
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if len(packet) < ihl+8 {
+		return false
+	}
+	return binary.BigEndian.Uint16(packet[ihl+2:ihl+4]) == port
 }
 
 func MobilePacketFlowDebugStats() string {
