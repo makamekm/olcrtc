@@ -135,6 +135,7 @@ type packetFlowReadWriter struct {
 	udpRejectMu          sync.Mutex
 	udpRejectWindowStart time.Time
 	udpRejectWindowCount int
+	udpDropSamples       map[string]int
 	udpICMPRejected      uint64
 	udpICMPSilent        uint64
 	inPackets            uint64
@@ -155,30 +156,47 @@ type packetFlowReadWriter struct {
 	dnsSocks             uint64
 	dnsCache             uint64
 	udpDropped           uint64
+	tcpInjected          uint64
+	tcpOutbound          uint64
+	tcpChecksumFixed     uint64
+	tcpOutboundCsumFixed uint64
+	tcpMSSClamped        uint64
+	oversizeInjected     uint64
+	oversizeOutbound     uint64
+	zeroReadSkipped      uint64
+	oversizeReadSkipped  uint64
 }
 
 func newPacketFlowReadWriter(mtu int, socksHost string, socksPort int) *packetFlowReadWriter {
 	dnsServer := currentPacketFlowDNSServer()
 	return &packetFlowReadWriter{
-		inbound:   make(chan []byte, 2048),
-		outbound:  make(chan []byte, 2048),
-		closed:    make(chan struct{}),
-		mtu:       mtu,
-		socksHost: socksHost,
-		socksPort: socksPort,
-		dnsServer: dnsServer,
+		inbound:        make(chan []byte, 2048),
+		outbound:       make(chan []byte, 2048),
+		closed:         make(chan struct{}),
+		mtu:            mtu,
+		socksHost:      socksHost,
+		socksPort:      socksPort,
+		dnsServer:      dnsServer,
+		udpDropSamples: make(map[string]int),
 	}
 }
 
 func (rw *packetFlowReadWriter) Read(dst []byte) (int, error) {
-	select {
-	case <-rw.closed:
-		return 0, io.ErrClosedPipe
-	case packet := <-rw.inbound:
-		if len(packet) == 0 || len(packet) > rw.mtu {
-			return 0, nil
+	for {
+		select {
+		case <-rw.closed:
+			return 0, io.ErrClosedPipe
+		case packet := <-rw.inbound:
+			if len(packet) == 0 {
+				atomic.AddUint64(&rw.zeroReadSkipped, 1)
+				continue
+			}
+			if len(packet) > rw.mtu {
+				atomic.AddUint64(&rw.oversizeReadSkipped, 1)
+				continue
+			}
+			return copy(dst, packet), nil
 		}
-		return copy(dst, packet), nil
 	}
 }
 
@@ -187,6 +205,7 @@ func (rw *packetFlowReadWriter) Write(packet []byte) (int, error) {
 		return 0, nil
 	}
 	copyPacket := append([]byte(nil), packet...)
+	rw.prepareOutboundPacket(copyPacket)
 	select {
 	case <-rw.closed:
 		return 0, io.ErrClosedPipe
@@ -201,6 +220,9 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 	if len(packet) == 0 {
 		return nil
 	}
+	if len(packet) > rw.mtu {
+		atomic.AddUint64(&rw.oversizeInjected, 1)
+	}
 	if rw.tryHandleDNS(packet) {
 		return nil
 	}
@@ -209,11 +231,13 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 		// iOS packet-flow bridge. Forwarding QUIC/media UDP/443 through SOCKS5
 		// UDP ASSOCIATE looks like activity in PacketTunnel counters but leaves
 		// real YouTube stuck on feed/player loading on current RUPN transports.
-		// YouTube repeats UDP/443 packets while probing QUIC. A lifetime budget
-		// or per-flow cooldown turns those repeats into a silent blackhole, so
-		// reply with ICMP port-unreachable for every rejected UDP packet while a
-		// replenishing global window keeps the PacketTunnel outbound queue safe.
+		// Safari/WebKit can generate large bursts of UDP/443/QUIC probes under
+		// includeAllNetworks=true. Silent drops make YouTube/WebKit wait on QUIC
+		// timeouts before falling back to TCP; send ICMP port-unreachable through
+		// a replenishing per-window limiter so system apps fall back quickly
+		// without letting ICMP storms starve TCP responses.
 		atomic.AddUint64(&rw.udpDropped, 1)
+		rw.recordUDPDropped(packet)
 		if rw.shouldRejectUDP(packet) {
 			if resp, ok := buildIPv4ICMPPortUnreachable(packet); ok {
 				if rw.Respond(resp) == nil {
@@ -227,6 +251,15 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 	}
 	if isIPv4UDP(packet) {
 		atomic.AddUint64(&rw.udpForwarded, 1)
+	}
+	if isIPv4TCP(packet) {
+		atomic.AddUint64(&rw.tcpInjected, 1)
+		if clampIPv4TCPMSS(packet, rw.tcpMSSLimit()) {
+			atomic.AddUint64(&rw.tcpMSSClamped, 1)
+		}
+		if normalizeIPv4Checksums(packet) {
+			atomic.AddUint64(&rw.tcpChecksumFixed, 1)
+		}
 	}
 	atomic.AddUint64(&rw.inPackets, 1)
 	copyPacket := append([]byte(nil), packet...)
@@ -245,6 +278,7 @@ func (rw *packetFlowReadWriter) Respond(packet []byte) error {
 		return nil
 	}
 	copyPacket := append([]byte(nil), packet...)
+	rw.prepareOutboundPacket(copyPacket)
 	select {
 	case <-rw.closed:
 		return io.ErrClosedPipe
@@ -253,6 +287,26 @@ func (rw *packetFlowReadWriter) Respond(packet []byte) error {
 	default:
 		return errors.New("packet-flow outbound queue is full")
 	}
+}
+
+func (rw *packetFlowReadWriter) prepareOutboundPacket(packet []byte) {
+	if len(packet) > rw.mtu {
+		atomic.AddUint64(&rw.oversizeOutbound, 1)
+	}
+	if isIPv4TCP(packet) {
+		atomic.AddUint64(&rw.tcpOutbound, 1)
+		if normalizeIPv4Checksums(packet) {
+			atomic.AddUint64(&rw.tcpOutboundCsumFixed, 1)
+		}
+	}
+}
+
+func (rw *packetFlowReadWriter) tcpMSSLimit() uint16 {
+	limit := rw.mtu - 40
+	if limit <= 0 || limit > 1200 {
+		limit = 1200
+	}
+	return uint16(limit)
 }
 
 func (rw *packetFlowReadWriter) ReadOutbound(timeout time.Duration) ([]byte, error) {
@@ -345,11 +399,46 @@ func dnsPayloadFromIPv4UDP(packet []byte) ([]byte, bool) {
 	return udp[8:udpLen], true
 }
 
+func (rw *packetFlowReadWriter) recordUDPDropped(packet []byte) {
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if ihl < 20 || len(packet) < ihl+4 {
+		return
+	}
+	dst := fmt.Sprintf("%d.%d.%d.%d:%d", packet[16], packet[17], packet[18], packet[19], binary.BigEndian.Uint16(packet[ihl+2:ihl+4]))
+	rw.udpRejectMu.Lock()
+	defer rw.udpRejectMu.Unlock()
+	if len(rw.udpDropSamples) < 16 || rw.udpDropSamples[dst] > 0 {
+		rw.udpDropSamples[dst]++
+	}
+}
+
+func (rw *packetFlowReadWriter) udpDropSampleString() string {
+	rw.udpRejectMu.Lock()
+	defer rw.udpRejectMu.Unlock()
+	if len(rw.udpDropSamples) == 0 {
+		return "-"
+	}
+	out := ""
+	for dst, count := range rw.udpDropSamples {
+		if out != "" {
+			out += ","
+		}
+		out += fmt.Sprintf("%s:%d", dst, count)
+	}
+	return out
+}
+
 func (rw *packetFlowReadWriter) shouldForwardUDP(packet []byte) bool {
 	return false
 }
 
 func (rw *packetFlowReadWriter) shouldRejectUDP(packet []byte) bool {
+	if packetFlowUDPICMPRejectWindowLimit <= 0 {
+		return false
+	}
 	if !isIPv4UDP(packet) {
 		return false
 	}
@@ -385,5 +474,117 @@ func MobilePacketFlowDebugStats() string {
 	if rw == nil {
 		return "packetflow=stopped"
 	}
-	return fmt.Sprintf("packetflow=running in=%d out=%d udp_forwarded=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d dns_direct_udp=%d dns_direct_tcp=%d dns_socks=%d dns_cache=%d udp_dropped=%d udp_icmp_rejected=%d udp_icmp_silent=%d %s", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.udpForwarded), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.dnsDirectUDP), atomic.LoadUint64(&rw.dnsDirectTCP), atomic.LoadUint64(&rw.dnsSocks), atomic.LoadUint64(&rw.dnsCache), atomic.LoadUint64(&rw.udpDropped), atomic.LoadUint64(&rw.udpICMPRejected), atomic.LoadUint64(&rw.udpICMPSilent), olclient.UDPRelayDebugStats())
+	return fmt.Sprintf("packetflow=running in=%d out=%d tcp_in=%d tcp_out=%d tcp_csum_fixed=%d tcp_out_csum_fixed=%d tcp_mss_clamped=%d oversize_in=%d oversize_out=%d zero_read_skip=%d oversize_read_skip=%d udp_forwarded=%d dns_seen=%d dns_answered=%d dns_miss=%d dns_a=%d dns_aaaa=%d dns_https=%d dns_svcb=%d dns_other=%d dns_a_ipv4=%d dns_a_empty=%d dns_direct_udp=%d dns_direct_tcp=%d dns_socks=%d dns_cache=%d udp_dropped=%d udp_icmp_rejected=%d udp_icmp_silent=%d udp_drop_samples=%s %s", atomic.LoadUint64(&rw.inPackets), atomic.LoadUint64(&rw.outPackets), atomic.LoadUint64(&rw.tcpInjected), atomic.LoadUint64(&rw.tcpOutbound), atomic.LoadUint64(&rw.tcpChecksumFixed), atomic.LoadUint64(&rw.tcpOutboundCsumFixed), atomic.LoadUint64(&rw.tcpMSSClamped), atomic.LoadUint64(&rw.oversizeInjected), atomic.LoadUint64(&rw.oversizeOutbound), atomic.LoadUint64(&rw.zeroReadSkipped), atomic.LoadUint64(&rw.oversizeReadSkipped), atomic.LoadUint64(&rw.udpForwarded), atomic.LoadUint64(&rw.dnsSeen), atomic.LoadUint64(&rw.dnsAnswered), atomic.LoadUint64(&rw.dnsMiss), atomic.LoadUint64(&rw.dnsA), atomic.LoadUint64(&rw.dnsAAAA), atomic.LoadUint64(&rw.dnsHTTPS), atomic.LoadUint64(&rw.dnsSVCB), atomic.LoadUint64(&rw.dnsOther), atomic.LoadUint64(&rw.dnsAWithIPv4), atomic.LoadUint64(&rw.dnsAEmpty), atomic.LoadUint64(&rw.dnsDirectUDP), atomic.LoadUint64(&rw.dnsDirectTCP), atomic.LoadUint64(&rw.dnsSocks), atomic.LoadUint64(&rw.dnsCache), atomic.LoadUint64(&rw.udpDropped), atomic.LoadUint64(&rw.udpICMPRejected), atomic.LoadUint64(&rw.udpICMPSilent), rw.udpDropSampleString(), olclient.UDPRelayDebugStats())
+}
+
+func isIPv4TCP(packet []byte) bool {
+	return len(packet) >= 20 && packet[0]>>4 == 4 && packet[9] == 6
+}
+
+func normalizeIPv4Checksums(packet []byte) bool {
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return false
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if ihl < 20 || len(packet) < ihl {
+		return false
+	}
+	totalLen := int(binary.BigEndian.Uint16(packet[2:4]))
+	if totalLen <= 0 || totalLen > len(packet) {
+		totalLen = len(packet)
+		binary.BigEndian.PutUint16(packet[2:4], uint16(totalLen))
+	}
+	packet[10], packet[11] = 0, 0
+	binary.BigEndian.PutUint16(packet[10:12], ipv4Checksum(packet[:ihl]))
+	switch packet[9] {
+	case 6:
+		seg := packet[ihl:totalLen]
+		if len(seg) < 20 {
+			return false
+		}
+		seg[16], seg[17] = 0, 0
+		binary.BigEndian.PutUint16(seg[16:18], transportChecksum(packet[12:16], packet[16:20], 6, seg))
+		return true
+	case 17:
+		udp := packet[ihl:totalLen]
+		if len(udp) < 8 {
+			return false
+		}
+		udp[6], udp[7] = 0, 0
+		binary.BigEndian.PutUint16(udp[6:8], udpChecksum(packet[12:16], packet[16:20], udp))
+		return true
+	default:
+		return false
+	}
+}
+
+func clampIPv4TCPMSS(packet []byte, maxMSS uint16) bool {
+	if len(packet) < 40 || packet[0]>>4 != 4 || packet[9] != 6 {
+		return false
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	totalLen := int(binary.BigEndian.Uint16(packet[2:4]))
+	if totalLen <= 0 || totalLen > len(packet) {
+		totalLen = len(packet)
+	}
+	if ihl < 20 || totalLen < ihl+20 {
+		return false
+	}
+	tcp := packet[ihl:totalLen]
+	tcpHeaderLen := int(tcp[12]>>4) * 4
+	if tcpHeaderLen < 20 || len(tcp) < tcpHeaderLen {
+		return false
+	}
+	if tcp[13]&0x02 == 0 {
+		return false
+	}
+	changed := false
+	for i := 20; i < tcpHeaderLen; {
+		kind := tcp[i]
+		switch kind {
+		case 0:
+			return changed
+		case 1:
+			i++
+			continue
+		}
+		if i+1 >= tcpHeaderLen {
+			return changed
+		}
+		optLen := int(tcp[i+1])
+		if optLen < 2 || i+optLen > tcpHeaderLen {
+			return changed
+		}
+		if kind == 2 && optLen == 4 {
+			mss := binary.BigEndian.Uint16(tcp[i+2 : i+4])
+			if mss > maxMSS {
+				binary.BigEndian.PutUint16(tcp[i+2:i+4], maxMSS)
+				changed = true
+			}
+		}
+		i += optLen
+	}
+	return changed
+}
+
+func transportChecksum(src, dst []byte, proto uint8, payload []byte) uint16 {
+	sum := uint32(0)
+	add := func(data []byte) {
+		for len(data) >= 2 {
+			sum += uint32(binary.BigEndian.Uint16(data[:2]))
+			data = data[2:]
+		}
+		if len(data) == 1 {
+			sum += uint32(data[0]) << 8
+		}
+	}
+	add(src)
+	add(dst)
+	sum += uint32(proto)
+	sum += uint32(len(payload))
+	add(payload)
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
 }
