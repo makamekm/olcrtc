@@ -165,6 +165,62 @@ func TestPeerSmallStateHelpers(t *testing.T) {
 	}
 }
 
+func TestTelemostPeerEventParsing(t *testing.T) {
+	cases := []struct {
+		name  string
+		msg   map[string]interface{}
+		want  string
+		ok    bool
+	}{
+		{
+			name: "joined message",
+			msg: map[string]interface{}{
+				"participantJoined": map[string]interface{}{"participantId": "client-1"},
+			},
+			want: "joined id=client-1",
+			ok:   true,
+		},
+		{
+			name: "left message",
+			msg: map[string]interface{}{
+				"participantLeft": map[string]interface{}{"participantId": "client-1"},
+			},
+			want: "left id=client-1",
+			ok:   true,
+		},
+		{
+			name: "terminated participant update",
+			msg: map[string]interface{}{
+				"participant": map[string]interface{}{"id": "client-1", "state": "terminated"},
+			},
+			want: "left id=client-1",
+			ok:   true,
+		},
+		{
+			name: "active participant update",
+			msg: map[string]interface{}{
+				"participant": map[string]interface{}{"id": "client-1", "state": "joined"},
+			},
+			want: "joined id=client-1",
+			ok:   true,
+		},
+		{
+			name: "unrelated",
+			msg:  map[string]interface{}{"ping": map[string]interface{}{}},
+			ok:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := telemostPeerEvent(tc.msg)
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("telemostPeerEvent() = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
 func TestTelemetryCfgParsing(t *testing.T) {
 	if _, _, ok := parseTelemetryCfg(map[string]interface{}{}); ok {
 		t.Fatal("parseTelemetryCfg() accepted missing config")

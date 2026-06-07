@@ -609,6 +609,9 @@ func (p *Peer) updateWSDeadline() {
 }
 
 func (p *Peer) handleCommonMessages(msg map[string]interface{}, uid string) {
+	if event, ok := telemostPeerEvent(msg); ok {
+		logger.Infof("telemost peer event: %s", event)
+	}
 	if _, ok := msg["updateDescription"]; ok {
 		p.sendAck(uid)
 	}
@@ -621,6 +624,41 @@ func (p *Peer) handleCommonMessages(msg map[string]interface{}, uid string) {
 	if _, ok := msg["pong"]; ok {
 		p.sendAck(uid)
 	}
+}
+
+func telemostPeerEvent(msg map[string]interface{}) (string, bool) {
+	if participant, ok := msg["participantJoined"].(map[string]interface{}); ok {
+		return "joined id=" + participantID(participant), true
+	}
+	if participant, ok := msg["participantLeft"].(map[string]interface{}); ok {
+		return "left id=" + participantID(participant), true
+	}
+	participant, ok := msg["participant"].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	state := strings.ToLower(participantString(participant, "state"))
+	if isEndedState(state) || state == "left" || state == "leaved" || state == "disconnected" {
+		return "left id=" + participantID(participant), true
+	}
+	if state == "joined" || state == "active" || state == "connected" || state == "online" {
+		return "joined id=" + participantID(participant), true
+	}
+	return "", false
+}
+
+func participantID(participant map[string]interface{}) string {
+	for _, key := range []string{"participantId", "id", "peerId", keyUID} {
+		if value := participantString(participant, key); value != "" {
+			return value
+		}
+	}
+	return "unknown"
+}
+
+func participantString(participant map[string]interface{}, key string) string {
+	value, _ := participant[key].(string)
+	return value
 }
 
 func (p *Peer) handleSdpOffer(offer map[string]interface{}, uid string, sendPub bool) error {
