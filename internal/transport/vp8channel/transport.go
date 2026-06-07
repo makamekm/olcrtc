@@ -650,12 +650,17 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 				return
 			}
 			if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
-				p.lastEpochReset.Store(now)
 				if p.inFrames.Load() == 0 {
-					logger.Infof("vp8channel: peer epoch accepted during zero ingress prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
-				} else {
-					logger.Infof("vp8channel: peer epoch changed prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
+					// Before the first data-bearing KCP packet, Telemost may expose
+					// multiple stale/reflected VP8 tracks from the same participant
+					// identity. Treat the newest epoch as convergence, not as a
+					// restart: resetting KCP here drains the first smux SYN/HTTP
+					// probe and leaves the peer with keepalives only (zero ingress).
+					logger.Infof("vp8channel: peer epoch accepted during zero ingress prev=0x%08x next=0x%08x - keeping KCP", prev, peerEpoch)
+					return
 				}
+				p.lastEpochReset.Store(now)
+				logger.Infof("vp8channel: peer epoch changed prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
 				p.resetKCP()
 				p.reconnectMu.Lock()
 				fn := p.reconnectFn
@@ -664,7 +669,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 					fn()
 				}
 			}
-			// Drop this packet: it predates our fresh KCP session.
+			// Drop this packet: it predates our fresh KCP session or carries only an epoch keepalive.
 			return
 		}
 	}

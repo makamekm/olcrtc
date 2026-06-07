@@ -338,9 +338,10 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	reconnected = false
 	tr.lastEpochReset.Store(time.Now().UnixNano())
 	tr.inFrames.Store(0)
+	beforeKCP := tr.kcp
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 4, []byte("zero-ingress-remote-restart")))
-	if !reconnected || tr.peerEpoch.Load() != 4 || tr.kcp == nil {
-		t.Fatalf("zero-ingress epoch change should bypass cooldown and reset/reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+	if reconnected || tr.peerEpoch.Load() != 4 || tr.kcp != beforeKCP {
+		t.Fatalf("zero-ingress epoch change should adopt without reset/reconnect: reconnected=%v epoch=%d kcp=%v before=%v", reconnected, tr.peerEpoch.Load(), tr.kcp, beforeKCP) //nolint:lll // long test description
 	}
 
 	reconnected = false
