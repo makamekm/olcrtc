@@ -109,6 +109,7 @@ type streamTransport struct {
 	localReconnectAt atomic.Int64
 	firstPeerAt      atomic.Int64
 	activeTrackID    atomic.Uint64
+	remoteTrackSeq   atomic.Uint64
 
 	// localEpoch is bumped on every KCP session restart and stamped into
 	// every outgoing VP8 frame. peerEpoch tracks the last epoch we observed
@@ -477,10 +478,10 @@ func (p *streamTransport) handleRemoteTrack(track *webrtc.TrackRemote, _ *webrtc
 		return
 	}
 
-	// Telemost can keep stale VP8 tracks alive for a few seconds when the same
-	// participant identity reconnects. Consume all tracks, but deliver frames
-	// only from the newest track to avoid feeding old epochs into KCP.
-	trackID := p.activeTrackID.Add(1)
+	// Telemost can announce reflected/stale tracks while the real peer track is
+	// still usable. A newly announced track must not become active until it
+	// proves it carries a valid non-self frame for this binding token.
+	trackID := p.remoteTrackSeq.Add(1)
 	go p.readVP8Track(track, trackID)
 }
 
@@ -566,11 +567,7 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote, trackID uint64
 		if frame == nil {
 			continue
 		}
-		if p.activeTrackID.Load() != trackID {
-			continue
-		}
-
-		p.handleIncomingFrame(frame)
+		p.handleIncomingFrameFromTrack(frame, trackID)
 	}
 }
 
@@ -595,6 +592,10 @@ func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
 // payload to the local session or triggers a reset when the peer's epoch
 // changes (peer process restart).
 func (p *streamTransport) handleIncomingFrame(frame []byte) {
+	p.handleIncomingFrameFromTrack(frame, 0)
+}
+
+func (p *streamTransport) handleIncomingFrameFromTrack(frame []byte, trackID uint64) {
 	frameToken := binary.BigEndian.Uint32(frame[tokenOff:epochOff])
 	if frameToken != p.bindingToken {
 		logger.Debugf("vp8channel: frame token mismatch got=0x%08x want=0x%08x (foreign client or noise)",
@@ -610,6 +611,29 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	if peerEpoch == p.localEpoch {
 		logger.Debugf("vp8channel: self-echo detected epoch=0x%08x (SFU reflects our own track)", peerEpoch)
 		return
+	}
+
+	if trackID != 0 {
+		activeTrackID := p.activeTrackID.Load()
+		if activeTrackID != 0 && activeTrackID != trackID {
+			lastIngressAt := p.lastIngressAt.Load()
+			activeRecentlyDelivered := lastIngressAt != 0 && time.Since(time.Unix(0, lastIngressAt)) < 5*time.Second
+			// Do not let a newly announced reflected/stale track steal delivery from
+			// a track that is still producing usable KCP packets. This keeps the
+			// original anti-stale-track behavior, but avoids the hard freeze caused
+			// by switching activeTrackID before seeing a valid peer frame.
+			if activeRecentlyDelivered {
+				logger.Debugf("vp8channel: candidate track ignored while active track has recent ingress track=%d active=%d epoch=0x%08x", trackID, activeTrackID, peerEpoch)
+				return
+			}
+			if prev := p.peerEpoch.Load(); prev != 0 && prev != peerEpoch && p.inFrames.Load() == 0 {
+				logger.Debugf("vp8channel: candidate track epoch change ignored during zero ingress track=%d active=%d prev=0x%08x next=0x%08x", trackID, activeTrackID, prev, peerEpoch)
+				return
+			}
+		}
+		if activeTrackID != trackID && p.activeTrackID.CompareAndSwap(activeTrackID, trackID) {
+			logger.Infof("vp8channel: remote track promoted active=%d prev=%d epoch=0x%08x", trackID, activeTrackID, peerEpoch)
+		}
 	}
 
 	if !p.hadPeer.Swap(true) {

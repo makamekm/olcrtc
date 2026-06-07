@@ -198,3 +198,62 @@ func TestHandleIncomingFrameIgnoresForeignBindingToken(t *testing.T) {
 		t.Fatalf("reconnect called on foreign frame: got %d want 0", got)
 	}
 }
+
+func testFrameForTransport(tr *streamTransport, epoch uint32, payload []byte) []byte {
+	frame := make([]byte, epochHdrLen+len(payload))
+	copy(frame, vp8Keepalive)
+	binary.BigEndian.PutUint32(frame[tokenOff:epochOff], tr.bindingToken)
+	binary.BigEndian.PutUint32(frame[epochOff:], epoch)
+	copy(frame[epochHdrLen:], payload)
+	return frame
+}
+
+func TestRemoteTrackIsNotPromotedBySelfEcho(t *testing.T) {
+	tr := &streamTransport{
+		bindingToken: bindingToken("test"),
+		localEpoch:   0x11111111,
+	}
+	tr.activeTrackID.Store(7)
+	tr.handleIncomingFrameFromTrack(testFrameForTransport(tr, tr.localEpoch, []byte{1, 2, 3}), 8)
+	if got := tr.activeTrackID.Load(); got != 7 {
+		t.Fatalf("self-echo promoted track: got %d want 7", got)
+	}
+	if tr.hadPeer.Load() {
+		t.Fatal("self-echo must not mark peer seen")
+	}
+}
+
+func TestFirstValidPeerFramePromotesRemoteTrack(t *testing.T) {
+	tr := &streamTransport{
+		bindingToken: bindingToken("test"),
+		localEpoch:   0x11111111,
+		outbound:     make(chan []byte, outboundQueueSize),
+		onData:       func([]byte) {},
+	}
+	tr.handleIncomingFrameFromTrack(testFrameForTransport(tr, 0x22222222, nil), 9)
+	if got := tr.activeTrackID.Load(); got != 9 {
+		t.Fatalf("valid peer frame did not promote track: got %d want 9", got)
+	}
+	if got := tr.peerEpoch.Load(); got != 0x22222222 {
+		t.Fatalf("peer epoch = 0x%08x, want 0x22222222", got)
+	}
+}
+
+func TestCandidateTrackCannotStealFromRecentlyDeliveringActiveTrack(t *testing.T) {
+	tr := &streamTransport{
+		bindingToken: bindingToken("test"),
+		localEpoch:   0x11111111,
+	}
+	tr.activeTrackID.Store(3)
+	tr.peerEpoch.Store(0x22222222)
+	tr.hadPeer.Store(true)
+	tr.inFrames.Store(10)
+	tr.lastIngressAt.Store(time.Now().UnixNano())
+	tr.handleIncomingFrameFromTrack(testFrameForTransport(tr, 0x33333333, []byte{1, 2, 3}), 4)
+	if got := tr.activeTrackID.Load(); got != 3 {
+		t.Fatalf("candidate stole active track: got %d want 3", got)
+	}
+	if got := tr.peerEpoch.Load(); got != 0x22222222 {
+		t.Fatalf("candidate changed epoch: got 0x%08x want 0x22222222", got)
+	}
+}
