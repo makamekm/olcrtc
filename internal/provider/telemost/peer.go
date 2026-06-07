@@ -228,9 +228,11 @@ func (p *Peer) attachPendingVideoTracks() error {
 	defer p.videoTrackMu.RUnlock()
 
 	for _, track := range p.videoTracks {
-		if _, err := p.pcPub.AddTrack(track); err != nil {
+		sender, err := p.pcPub.AddTrack(track)
+		if err != nil {
 			return fmt.Errorf("add video track: %w", err)
 		}
+		go drainRTCP(sender)
 	}
 
 	return nil
@@ -1586,10 +1588,21 @@ func (p *Peer) AddVideoTrack(track webrtc.TrackLocal) error {
 	if p.pcPub == nil {
 		return nil
 	}
-	if _, err := p.pcPub.AddTrack(track); err != nil {
+	sender, err := p.pcPub.AddTrack(track)
+	if err != nil {
 		return fmt.Errorf("failed to add track: %w", err)
 	}
+	go drainRTCP(sender)
 	return nil
+}
+
+func drainRTCP(sender *webrtc.RTPSender) {
+	for {
+		if _, _, err := sender.ReadRTCP(); err != nil {
+			logger.Debugf("telemost publisher RTCP read ended: %v", err)
+			return
+		}
+	}
 }
 
 // SetVideoTrackHandler registers a callback for remote video tracks.
