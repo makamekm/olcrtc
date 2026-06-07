@@ -477,11 +477,9 @@ func (p *streamTransport) handleRemoteTrack(track *webrtc.TrackRemote, _ *webrtc
 		return
 	}
 
-	// Telemost can add reflected/stale VP8 tracks while the real peer track is
-	// still carrying traffic. Do not make a newly announced track exclusive: a
-	// self-echo or empty reflected track can otherwise steal activeTrackID and
-	// freeze ingress from the still-good peer track. Consume every VP8 track and
-	// let handleIncomingFrame filter by binding token, local epoch, and peer epoch.
+	// Telemost can keep stale VP8 tracks alive for a few seconds when the same
+	// participant identity reconnects. Consume all tracks, but deliver frames
+	// only from the newest track to avoid feeding old epochs into KCP.
 	trackID := p.activeTrackID.Add(1)
 	go p.readVP8Track(track, trackID)
 }
@@ -549,7 +547,7 @@ func (s *vp8FrameState) processRTPPacket(pkt *rtp.Packet) []byte {
 	return nil
 }
 
-func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote, _ uint64) {
+func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote, trackID uint64) {
 	var state vp8FrameState
 	buf := make([]byte, rtpBufSize)
 
@@ -568,6 +566,10 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote, _ uint64) {
 		if frame == nil {
 			continue
 		}
+		if p.activeTrackID.Load() != trackID {
+			continue
+		}
+
 		p.handleIncomingFrame(frame)
 	}
 }
