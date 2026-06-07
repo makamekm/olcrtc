@@ -239,7 +239,7 @@ func TestZeroIngressEpochChangeKeepsExistingKCP(t *testing.T) {
 	}
 }
 
-func TestPostIngressEpochChangeResetsKCP(t *testing.T) {
+func TestPostIngressEpochChangeKeepsKCP(t *testing.T) {
 	out := make(chan []byte, 16)
 	rt, err := startKCP(out, func([]byte) {}, testEpochHdr(111))
 	if err != nil {
@@ -266,20 +266,18 @@ func TestPostIngressEpochChangeResetsKCP(t *testing.T) {
 	if got := tr.peerEpoch.Load(); got != 333 {
 		t.Fatalf("peer epoch = %d, want 333", got)
 	}
-	if got := tr.lastEpochReset.Load(); got == 0 {
-		t.Fatal("lastEpochReset not updated after post-ingress epoch change")
+	if got := tr.lastEpochReset.Load(); got != 0 {
+		t.Fatalf("lastEpochReset updated after post-ingress epoch change: got %d want 0", got)
 	}
-	if got := called.Load(); got != 1 {
-		t.Fatalf("reconnect calls = %d, want 1", got)
+	if got := called.Load(); got != 0 {
+		t.Fatalf("reconnect calls = %d, want 0", got)
 	}
 	tr.kcpMu.RLock()
-	reset := tr.kcp != nil && tr.kcp != rt
-	newRT := tr.kcp
+	kept := tr.kcp == rt
 	tr.kcpMu.RUnlock()
-	if !reset {
-		t.Fatal("post-ingress epoch change did not reset KCP")
+	if !kept {
+		t.Fatal("post-ingress epoch change reset KCP")
 	}
-	newRT.close()
 }
 
 func testVP8Frame(t *testing.T, token uint32, epoch uint32, payload []byte) []byte {

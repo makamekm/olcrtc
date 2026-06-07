@@ -663,59 +663,19 @@ func (p *streamTransport) handleIncomingFrameFromTrack(frame []byte, trackID uin
 				)
 			}
 		} else {
-			// Peer restarted its KCP session. Reset ours so the conv state
-			// machines re-converge. CAS guards against double-reset when
-			// fragmented frames straddle the epoch boundary.
-			if localReconnectAt := p.localReconnectAt.Load(); localReconnectAt != 0 && time.Duration(now-localReconnectAt) < 60*time.Second {
-				if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
-					p.lastEpochReset.Store(now)
-					logger.Infof("vp8channel: peer epoch accepted after local reconnect prev=0x%08x next=0x%08x", prev, peerEpoch)
-					p.resetKCP()
-				}
-				return
-			}
-			last := p.lastEpochReset.Load()
-			// Telemost can surface a stale/reflected track with a different epoch
-			// while the active track is still delivering usable KCP packets. Do not
-			// tear down a live smux/KCP session on that first epoch blip; wait until
-			// ingress has actually gone quiet before treating it as peer restart.
-			if p.inFrames.Load() > 0 {
-				lastIngressAt := p.lastIngressAt.Load()
-				if lastIngressAt != 0 && time.Duration(now-lastIngressAt) < 20*time.Second {
-					logger.Debugf("vp8channel: peer epoch ignored during recent ingress prev=0x%08x next=0x%08x", prev, peerEpoch)
-					return
-				}
-			}
-			if p.shouldSuppressPeerEpochChange(now, last) {
-				logger.Debugf(
-					"vp8channel: peer epoch change suppressed prev=0x%08x next=0x%08x",
-					prev,
-					peerEpoch,
-				)
-				return
-			}
+			// Telemost can surface stale/reflected VP8 tracks with a different epoch
+			// after the initial grace window while the current smux/KCP session is
+			// still usable. Resetting KCP here freezes Android after a successful
+			// burst: server ingress plateaus while Android still reports active.
+			// Adopt the newest epoch as SFU convergence and keep KCP alive; a real
+			// dead transport is handled by the client/service reconnect path.
 			if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
 				if p.inFrames.Load() == 0 {
-					// Before the first data-bearing KCP packet, Telemost may expose
-					// multiple stale/reflected VP8 tracks from the same participant
-					// identity. Treat the newest epoch as convergence, not as a
-					// restart: resetting KCP here drains the first smux SYN/HTTP
-					// probe and leaves the peer with keepalives only (zero ingress).
 					logger.Infof("vp8channel: peer epoch accepted during zero ingress prev=0x%08x next=0x%08x - keeping KCP", prev, peerEpoch)
-					return
-				}
-				p.lastEpochReset.Store(now)
-				logger.Infof("vp8channel: peer epoch changed prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
-				p.resetKCP()
-				p.reconnectMu.Lock()
-				fn := p.reconnectFn
-				p.reconnectMu.Unlock()
-				if fn != nil {
-					fn()
+				} else {
+					logger.Infof("vp8channel: peer epoch accepted during active ingress prev=0x%08x next=0x%08x - keeping KCP", prev, peerEpoch)
 				}
 			}
-			// Drop this packet: it predates our fresh KCP session or carries only an epoch keepalive.
-			return
 		}
 	}
 
