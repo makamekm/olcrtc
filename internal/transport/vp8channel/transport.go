@@ -103,6 +103,7 @@ type streamTransport struct {
 	outBytes         atomic.Uint64
 	inFrames         atomic.Uint64
 	inBytes          atomic.Uint64
+	idleNonce        atomic.Uint64
 	lastStats        atomic.Int64
 	lastEpochReset   atomic.Int64
 	lastIngressAt    atomic.Int64
@@ -350,8 +351,7 @@ func (p *streamTransport) writerLoop() {
 					continue
 				}
 				idleTicks = 0
-				hdr := p.epochHeader()
-				frames = [][]byte{hdr[:]}
+				frames = [][]byte{p.buildIdleFrame()}
 			} else {
 				idleTicks = 0
 			}
@@ -369,6 +369,16 @@ func (p *streamTransport) writerLoop() {
 			p.maybeLogStats()
 		}
 	}
+}
+
+func (p *streamTransport) buildIdleFrame() []byte {
+	hdr := p.epochHeader()
+	frame := make([]byte, epochHdrLen+10)
+	copy(frame, hdr[:])
+	binary.BigEndian.PutUint32(frame[epochHdrLen:epochHdrLen+4], batchMagic)
+	binary.BigEndian.PutUint16(frame[epochHdrLen+4:epochHdrLen+6], 0)
+	binary.BigEndian.PutUint32(frame[epochHdrLen+6:epochHdrLen+10], uint32(p.idleNonce.Add(1)))
+	return frame
 }
 
 func (p *streamTransport) maybeLogStats() {
@@ -641,6 +651,17 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 				return
 			}
 			last := p.lastEpochReset.Load()
+			// Telemost can surface a stale/reflected track with a different epoch
+			// while the active track is still delivering usable KCP packets. Do not
+			// tear down a live smux/KCP session on that first epoch blip; wait until
+			// ingress has actually gone quiet before treating it as peer restart.
+			if p.inFrames.Load() > 0 {
+				lastIngressAt := p.lastIngressAt.Load()
+				if lastIngressAt != 0 && time.Duration(now-lastIngressAt) < 20*time.Second {
+					logger.Debugf("vp8channel: peer epoch ignored during recent ingress prev=0x%08x next=0x%08x", prev, peerEpoch)
+					return
+				}
+			}
 			if p.shouldSuppressPeerEpochChange(now, last) {
 				logger.Debugf(
 					"vp8channel: peer epoch change suppressed prev=0x%08x next=0x%08x",
