@@ -77,7 +77,11 @@ func (rw *androidTunReadWriter) Write(packet []byte) (int, error) {
 	if len(packet) == 0 {
 		return 0, nil
 	}
-	n, err := rw.tun.Write(packet)
+	copyPacket := append([]byte(nil), packet...)
+	if isIPv4TCP(copyPacket) {
+		normalizeIPv4Checksums(copyPacket)
+	}
+	n, err := rw.tun.Write(copyPacket)
 	if err == nil && n > 0 {
 		atomic.AddUint64(&rw.outPackets, 1)
 	}

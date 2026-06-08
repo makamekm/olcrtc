@@ -109,7 +109,6 @@ type streamTransport struct {
 	lastIngressAt    atomic.Int64
 	localReconnectAt atomic.Int64
 	firstPeerAt      atomic.Int64
-	activeTrackID    atomic.Uint64
 
 	// localEpoch is bumped on every KCP session restart and stamped into
 	// every outgoing VP8 frame. peerEpoch tracks the last epoch we observed
@@ -487,11 +486,12 @@ func (p *streamTransport) handleRemoteTrack(track *webrtc.TrackRemote, _ *webrtc
 		return
 	}
 
-	// Telemost can keep stale VP8 tracks alive for a few seconds when the same
-	// participant identity reconnects. Consume all tracks, but deliver frames
-	// only from the newest track to avoid feeding old epochs into KCP.
-	trackID := p.activeTrackID.Add(1)
-	go p.readVP8Track(track, trackID)
+	// Telemost can expose multiple VP8 tracks for the same participant across
+	// reconnects/SFU churn. Read and deliver all valid frames; token, self-echo,
+	// and epoch handling below decide whether a frame belongs to the peer. A
+	// "newest track wins" gate can freeze ingress when Telemost announces a new
+	// track that then goes quiet while the old peer track is still carrying KCP.
+	go p.readVP8Track(track)
 }
 
 func (p *streamTransport) drainTrack(track *webrtc.TrackRemote) {
@@ -557,7 +557,7 @@ func (s *vp8FrameState) processRTPPacket(pkt *rtp.Packet) []byte {
 	return nil
 }
 
-func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote, trackID uint64) {
+func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 	var state vp8FrameState
 	buf := make([]byte, rtpBufSize)
 
@@ -576,10 +576,6 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote, trackID uint64
 		if frame == nil {
 			continue
 		}
-		if p.activeTrackID.Load() != trackID {
-			continue
-		}
-
 		p.handleIncomingFrame(frame)
 	}
 }
@@ -639,54 +635,35 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 				)
 			}
 		} else {
-			// Peer restarted its KCP session. Reset ours so the conv state
-			// machines re-converge. CAS guards against double-reset when
-			// fragmented frames straddle the epoch boundary.
-			if localReconnectAt := p.localReconnectAt.Load(); localReconnectAt != 0 && time.Duration(now-localReconnectAt) < 60*time.Second {
+			lastIngressAt := p.lastIngressAt.Load()
+			recentIngress := lastIngressAt != 0 && time.Duration(now-lastIngressAt) < 20*time.Second
+			if p.inFrames.Load() > 0 && recentIngress {
+				// Telemost/SFU can churn VP8 track epochs while the smux/KCP session is
+				// still carrying traffic. Adopt the newest peer epoch and deliver the
+				// payload instead of tearing down in-flight streams.
+				if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
+					logger.Infof("vp8channel: peer epoch accepted during active ingress prev=0x%08x next=0x%08x - keeping KCP", prev, peerEpoch)
+				}
+			} else if !p.shouldSuppressPeerEpochChange(now, p.lastEpochReset.Load()) {
+				// If ingress is absent/stale, a new peer epoch is a real peer process
+				// restart (Stop->Start with the same room/client). Reset KCP and reinstall
+				// smux so the first new streams don't get written into a dead session.
 				if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
 					p.lastEpochReset.Store(now)
-					logger.Infof("vp8channel: peer epoch accepted after local reconnect prev=0x%08x next=0x%08x", prev, peerEpoch)
+					logger.Infof("vp8channel: peer epoch accepted after stale ingress prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
 					p.resetKCP()
+					p.reconnectMu.Lock()
+					fn := p.reconnectFn
+					p.reconnectMu.Unlock()
+					if fn != nil {
+						fn()
+					}
 				}
 				return
-			}
-			last := p.lastEpochReset.Load()
-			// Telemost can surface a stale/reflected track with a different epoch
-			// while the active track is still delivering usable KCP packets. Do not
-			// tear down a live smux/KCP session on that first epoch blip; wait until
-			// ingress has actually gone quiet before treating it as peer restart.
-			if p.inFrames.Load() > 0 {
-				lastIngressAt := p.lastIngressAt.Load()
-				if lastIngressAt != 0 && time.Duration(now-lastIngressAt) < 20*time.Second {
-					logger.Debugf("vp8channel: peer epoch ignored during recent ingress prev=0x%08x next=0x%08x", prev, peerEpoch)
-					return
-				}
-			}
-			if p.shouldSuppressPeerEpochChange(now, last) {
-				logger.Debugf(
-					"vp8channel: peer epoch change suppressed prev=0x%08x next=0x%08x",
-					prev,
-					peerEpoch,
-				)
+			} else {
+				logger.Debugf("vp8channel: peer epoch change suppressed prev=0x%08x next=0x%08x", prev, peerEpoch)
 				return
 			}
-			if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
-				p.lastEpochReset.Store(now)
-				if p.inFrames.Load() == 0 {
-					logger.Infof("vp8channel: peer epoch accepted during zero ingress prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
-				} else {
-					logger.Infof("vp8channel: peer epoch changed prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
-				}
-				p.resetKCP()
-				p.reconnectMu.Lock()
-				fn := p.reconnectFn
-				p.reconnectMu.Unlock()
-				if fn != nil {
-					fn()
-				}
-			}
-			// Drop this packet: it predates our fresh KCP session.
-			return
 		}
 	}
 

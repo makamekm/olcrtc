@@ -87,6 +87,30 @@ func TestAndroidTunReadWriterRejectsNonDNSUDPWithICMP(t *testing.T) {
 	}
 }
 
+func TestAndroidTunReadWriterNormalizesTCPBeforeTunWrite(t *testing.T) {
+	resetMobileGlobals(t)
+	tun := newMemoryTun()
+	rw := newAndroidTunReadWriter(tun, 1280, "127.0.0.1", 10808)
+
+	packet := buildTestIPv4TCPSynPacket([4]byte{93, 184, 216, 34}, [4]byte{10, 8, 0, 2}, 443, 55555, 1200)
+	packet[10], packet[11] = 0x12, 0x34
+	ihl := int(packet[0]&0x0f) * 4
+	packet[ihl+16], packet[ihl+17] = 0x56, 0x78
+	if _, err := rw.Write(packet); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	got := waitMemoryTunWrite(t, tun)
+	if got[10] == 0x12 && got[11] == 0x34 {
+		t.Fatalf("IPv4 checksum was not normalized")
+	}
+	if got[ihl+16] == 0x56 && got[ihl+17] == 0x78 {
+		t.Fatalf("TCP checksum was not normalized")
+	}
+	if out := atomic.LoadUint64(&rw.outPackets); out != 1 {
+		t.Fatalf("outPackets = %d, want 1", out)
+	}
+}
+
 func TestPacketFlowReadWriterRejectsMediaUDP443WithICMP(t *testing.T) {
 	resetMobileGlobals(t)
 	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)

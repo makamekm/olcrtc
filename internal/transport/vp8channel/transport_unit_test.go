@@ -332,32 +332,32 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	tr.firstPeerAt.Store(time.Now().Add(-11 * time.Second).UnixNano())
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 3, []byte("after-local-reconnect")))
 	if reconnected || tr.peerEpoch.Load() != 3 || tr.kcp == nil {
-		t.Fatalf("epoch change after local reconnect should reset KCP without callback: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+		t.Fatalf("epoch change after local reconnect should keep KCP without callback: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
 	}
 	tr.localReconnectAt.Store(0)
 	reconnected = false
 	tr.lastEpochReset.Store(time.Now().UnixNano())
 	tr.inFrames.Store(0)
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 4, []byte("zero-ingress-remote-restart")))
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 4, []byte("zero-ingress-epoch-churn")))
 	if !reconnected || tr.peerEpoch.Load() != 4 || tr.kcp == nil {
-		t.Fatalf("zero-ingress epoch change should bypass cooldown and reset/reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+		t.Fatalf("zero-ingress epoch change should reset KCP and reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
 	}
 
 	reconnected = false
 	tr.lastEpochReset.Store(0)
 	tr.inFrames.Store(1)
 	tr.lastIngressAt.Store(time.Now().UnixNano())
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 5, []byte("recent-ingress-stale-epoch")))
-	if reconnected || tr.peerEpoch.Load() != 4 || tr.kcp == nil {
-		t.Fatalf("recent ingress epoch change should be ignored: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 5, []byte("recent-ingress-epoch-churn")))
+	if reconnected || tr.peerEpoch.Load() != 5 || tr.kcp == nil {
+		t.Fatalf("recent ingress epoch change should be adopted without reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
 	}
 
 	reconnected = false
 	tr.lastEpochReset.Store(time.Now().UnixNano())
 	tr.inFrames.Store(10)
 	tr.lastIngressAt.Store(time.Now().Add(-21 * time.Second).UnixNano())
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 6, []byte("frozen-ingress-remote-restart")))
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 6, []byte("frozen-ingress-epoch-churn")))
 	if !reconnected || tr.peerEpoch.Load() != 6 || tr.kcp == nil {
-		t.Fatalf("frozen ingress epoch change should bypass cooldown and reset/reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+		t.Fatalf("frozen ingress epoch change should reset KCP and reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
 	}
 }
