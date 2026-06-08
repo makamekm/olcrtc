@@ -347,9 +347,9 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	tr.lastEpochReset.Store(0)
 	tr.inFrames.Store(1)
 	tr.lastIngressAt.Store(time.Now().UnixNano())
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 5, []byte("after-remote-restart")))
-	if !reconnected || tr.peerEpoch.Load() != 5 || tr.kcp == nil {
-		t.Fatalf("remote epoch change after grace did not reset/reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 5, []byte("recent-ingress-stale-epoch")))
+	if reconnected || tr.peerEpoch.Load() != 4 || tr.kcp == nil {
+		t.Fatalf("recent ingress epoch change should be ignored: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
 	}
 
 	reconnected = false
