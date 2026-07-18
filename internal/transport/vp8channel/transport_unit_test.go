@@ -201,6 +201,12 @@ func TestEpochHeaderTokenAndOutboundCapacity(t *testing.T) {
 	if bindingToken("srv-android-01") != bindingToken("android-01") {
 		t.Fatal("server participant prefix must not change VP8 binding token")
 	}
+	if bindingToken("u-makame-device-1@1784398210646") != bindingToken("srv-u-makame-device-1") {
+		t.Fatal("runtime generation suffix must not change VP8 binding token")
+	}
+	if bindingToken("user@example.com") == bindingToken("user") {
+		t.Fatal("non-numeric @ suffix must remain part of VP8 binding identity")
+	}
 
 	rt, err := startKCP(tr.outbound, nil, tr.epochHeader())
 	if err != nil {

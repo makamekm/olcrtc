@@ -212,6 +212,12 @@ func (p *streamTransport) epochHeader() [epochHdrLen]byte {
 
 func bindingToken(clientID string) uint32 {
 	identity := strings.TrimPrefix(clientID, "srv-")
+	if separator := strings.LastIndexByte(identity, '@'); separator > 0 {
+		generation := identity[separator+1:]
+		if len(generation) >= 10 && strings.IndexFunc(generation, func(r rune) bool { return r < '0' || r > '9' }) == -1 {
+			identity = identity[:separator]
+		}
+	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(identity))
 	token := h.Sum32()
