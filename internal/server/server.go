@@ -10,10 +10,10 @@ import (
 	"io"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/openlibrecommunity/olcrtc/internal/clientidentity"
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
 	"github.com/openlibrecommunity/olcrtc/internal/link"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
@@ -414,11 +414,11 @@ func parseConnectRequest(buf []byte) (ConnectRequest, bool) {
 }
 
 func (s *Server) authorizeRequest(req ConnectRequest) bool {
-	return req.ClientID == serverClientIdentity(s.clientID)
+	return clientidentity.Normalize(req.ClientID) == serverClientIdentity(s.clientID)
 }
 
 func serverClientIdentity(clientID string) string {
-	return strings.TrimPrefix(clientID, "srv-")
+	return clientidentity.Normalize(clientID)
 }
 
 func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {

@@ -45,10 +45,23 @@ func TestSmuxConfig(t *testing.T) {
 	}
 }
 
+func TestServerClientIdentityNormalizesRuntimeGeneration(t *testing.T) {
+	if got := serverClientIdentity("srv-u-makame-device-1"); got != "u-makame-device-1" {
+		t.Fatalf("serverClientIdentity() = %q", got)
+	}
+	server := &Server{clientID: "srv-u-makame-device-1"}
+	if !server.authorizeRequest(ConnectRequest{ClientID: "u-makame-device-1@1784398210646"}) {
+		t.Fatal("generated runtime client ID must authorize against stable server identity")
+	}
+	if server.authorizeRequest(ConnectRequest{ClientID: "other-device@1784398210646"}) {
+		t.Fatal("different stable client identity must remain unauthorized")
+	}
+}
+
 func TestParseConnectRequest(t *testing.T) {
 	buf, err := json.Marshal(ConnectRequest{
 		Cmd:      "connect",
-		ClientID: "client-1", //nolint:goconst // test literal, repetition is intentional
+		ClientID: "client-1",    //nolint:goconst // test literal, repetition is intentional
 		Addr:     "example.com", //nolint:goconst // test literal, repetition is intentional
 		Port:     443,
 	})
