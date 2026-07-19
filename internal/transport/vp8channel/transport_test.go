@@ -199,13 +199,12 @@ func TestHandleIncomingFrameIgnoresForeignBindingToken(t *testing.T) {
 	}
 }
 
-func TestZeroIngressEpochChangeKeepsExistingKCP(t *testing.T) {
+func TestZeroIngressEpochChangePromotesPeerAndResetsKCP(t *testing.T) {
 	out := make(chan []byte, 16)
 	rt, err := startKCP(out, func([]byte) {}, testEpochHdr(111))
 	if err != nil {
 		t.Fatalf("startKCP: %v", err)
 	}
-	defer rt.close()
 
 	tr := &streamTransport{
 		bindingToken: bindingToken("test"),
@@ -225,18 +224,53 @@ func TestZeroIngressEpochChangeKeepsExistingKCP(t *testing.T) {
 	if got := tr.peerEpoch.Load(); got != 333 {
 		t.Fatalf("peer epoch = %d, want 333", got)
 	}
-	if got := tr.lastEpochReset.Load(); got != 0 {
-		t.Fatalf("lastEpochReset changed during zero ingress: %d", got)
+	if got := tr.lastEpochReset.Load(); got == 0 {
+		t.Fatal("lastEpochReset was not recorded during zero-ingress promotion")
 	}
 	if got := called.Load(); got != 0 {
 		t.Fatalf("reconnect called during zero ingress: got %d want 0", got)
 	}
 	tr.kcpMu.RLock()
-	kept := tr.kcp == rt
+	newKCP := tr.kcp
+	reset := newKCP != rt
 	tr.kcpMu.RUnlock()
-	if !kept {
-		t.Fatal("zero-ingress epoch change reset KCP")
+	if !reset {
+		t.Fatal("zero-ingress epoch change kept stale KCP")
 	}
+	defer newKCP.close()
+}
+
+func TestIdlePostIngressEpochChangePromotesPeerAndResetsKCP(t *testing.T) {
+	out := make(chan []byte, 16)
+	rt, err := startKCP(out, func([]byte) {}, testEpochHdr(111))
+	if err != nil {
+		t.Fatalf("startKCP: %v", err)
+	}
+	tr := &streamTransport{
+		bindingToken: bindingToken("test"),
+		localEpoch:   111,
+		outbound:     out,
+		kcp:          rt,
+	}
+	tr.hadPeer.Store(true)
+	tr.peerEpoch.Store(222)
+	tr.firstPeerAt.Store(time.Now().Add(-30 * time.Second).UnixNano())
+	tr.inFrames.Store(10)
+	tr.lastIngressAt.Store(time.Now().Add(-peerIngressIdlePeriod).Add(-time.Second).UnixNano())
+
+	tr.handleIncomingFrame(testVP8Frame(t, tr.bindingToken, 333, nil))
+
+	if got := tr.peerEpoch.Load(); got != 333 {
+		t.Fatalf("idle peer epoch = %d, want 333", got)
+	}
+	tr.kcpMu.RLock()
+	newKCP := tr.kcp
+	reset := newKCP != rt
+	tr.kcpMu.RUnlock()
+	if !reset {
+		t.Fatal("idle post-ingress epoch change kept stale KCP")
+	}
+	defer newKCP.close()
 }
 
 func TestPostIngressEpochChangeKeepsKCP(t *testing.T) {
@@ -257,14 +291,15 @@ func TestPostIngressEpochChangeKeepsKCP(t *testing.T) {
 	tr.peerEpoch.Store(222)
 	tr.firstPeerAt.Store(time.Now().Add(-30 * time.Second).UnixNano())
 	tr.inFrames.Store(1)
+	tr.lastIngressAt.Store(time.Now().UnixNano())
 
 	var called atomic.Int32
 	tr.reconnectFn = func() { called.Add(1) }
 
 	tr.handleIncomingFrame(testVP8Frame(t, tr.bindingToken, 333, nil))
 
-	if got := tr.peerEpoch.Load(); got != 333 {
-		t.Fatalf("peer epoch = %d, want 333", got)
+	if got := tr.peerEpoch.Load(); got != 222 {
+		t.Fatalf("active peer epoch was replaced: got %d want 222", got)
 	}
 	if got := tr.lastEpochReset.Load(); got != 0 {
 		t.Fatalf("lastEpochReset updated after post-ingress epoch change: got %d want 0", got)
