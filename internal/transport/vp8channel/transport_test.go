@@ -280,6 +280,47 @@ func TestPostIngressEpochChangeKeepsKCP(t *testing.T) {
 	}
 }
 
+func TestInitialGracePromotesOneEpochResetsKCPAndRejectsStaleFrames(t *testing.T) {
+	out := make(chan []byte, 32)
+	tr := &streamTransport{
+		bindingToken: bindingToken("test"),
+		localEpoch:   111,
+		outbound:     out,
+		onData:       func([]byte) {},
+	}
+
+	tr.handleIncomingFrame(testVP8Frame(t, tr.bindingToken, 222, nil))
+	tr.kcpMu.RLock()
+	firstKCP := tr.kcp
+	tr.kcpMu.RUnlock()
+	if firstKCP == nil {
+		t.Fatal("first peer did not start KCP")
+	}
+
+	tr.handleIncomingFrame(testVP8Frame(t, tr.bindingToken, 333, nil))
+	tr.kcpMu.RLock()
+	promotedKCP := tr.kcp
+	tr.kcpMu.RUnlock()
+	defer promotedKCP.close()
+	if promotedKCP == firstKCP {
+		t.Fatal("initial epoch promotion did not reset KCP")
+	}
+	if got := tr.peerEpoch.Load(); got != 333 {
+		t.Fatalf("promoted peer epoch = %d, want 333", got)
+	}
+
+	tr.handleIncomingFrame(testVP8Frame(t, tr.bindingToken, 222, []byte{1, 2, 3, 4}))
+	if got := tr.peerEpoch.Load(); got != 333 {
+		t.Fatalf("stale epoch replaced promoted epoch: got %d want 333", got)
+	}
+	tr.kcpMu.RLock()
+	keptKCP := tr.kcp
+	tr.kcpMu.RUnlock()
+	if keptKCP != promotedKCP {
+		t.Fatal("stale epoch reset promoted KCP")
+	}
+}
+
 func testVP8Frame(t *testing.T, token uint32, epoch uint32, payload []byte) []byte {
 	t.Helper()
 	frame := make([]byte, epochHdrLen+len(payload))

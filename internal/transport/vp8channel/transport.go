@@ -117,6 +117,10 @@ type streamTransport struct {
 	localEpoch   uint32
 	peerEpoch    atomic.Uint32
 	hadPeer      atomic.Bool
+	// initialPeerPromoted locks the first epoch change seen during SFU
+	// convergence. Telemost can keep sending the stale track after exposing the
+	// current one; feeding both epochs into one KCP runtime corrupts its state.
+	initialPeerPromoted atomic.Bool
 
 	kcp         *kcpRuntime
 	kcpMu       sync.RWMutex
@@ -627,12 +631,18 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		// first HTTP stream is torn down before smux has a chance to settle.
 		now := time.Now().UnixNano()
 		if first := p.firstPeerAt.Load(); first != 0 && time.Duration(now-first) < 10*time.Second {
-			if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
+			if !p.initialPeerPromoted.Swap(true) && p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
 				logger.Infof(
-					"vp8channel: peer epoch switched during initial grace prev=0x%08x next=0x%08x - no KCP reset",
+					"vp8channel: peer epoch promoted during initial grace prev=0x%08x next=0x%08x - resetting KCP",
 					prev,
 					peerEpoch,
 				)
+				p.lastEpochReset.Store(now)
+				p.resetKCP()
+			} else {
+				// Once the current SFU track has been promoted, frames from the
+				// previously selected stale epoch must not enter the new KCP runtime.
+				return
 			}
 		} else {
 			// Telemost can surface stale/reflected VP8 tracks with a different epoch
@@ -649,6 +659,9 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 				}
 			}
 		}
+	}
+	if peerEpoch != p.peerEpoch.Load() {
+		return
 	}
 
 	if len(kcpPayload) == 0 {
