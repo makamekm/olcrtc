@@ -354,6 +354,19 @@ func TestInitialGracePromotesOneEpochResetsKCPAndRejectsStaleFrames(t *testing.T
 	if keptKCP != promotedKCP {
 		t.Fatal("stale epoch reset promoted KCP")
 	}
+
+	tr.firstPeerAt.Store(time.Now().Add(-30 * time.Second).UnixNano())
+	tr.lastIngressAt.Store(time.Now().Add(-peerIngressIdlePeriod).Add(-time.Second).UnixNano())
+	tr.handleIncomingFrame(testVP8Frame(t, tr.bindingToken, 222, nil))
+	if got := tr.peerEpoch.Load(); got != 333 {
+		t.Fatalf("retired epoch was reselected after idle: got %d want 333", got)
+	}
+	tr.kcpMu.RLock()
+	keptKCP = tr.kcp
+	tr.kcpMu.RUnlock()
+	if keptKCP != promotedKCP {
+		t.Fatal("retired epoch reset KCP after idle")
+	}
 }
 
 func testVP8Frame(t *testing.T, token uint32, epoch uint32, payload []byte) []byte {

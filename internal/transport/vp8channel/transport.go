@@ -118,6 +118,9 @@ type streamTransport struct {
 	localEpoch   uint32
 	peerEpoch    atomic.Uint32
 	hadPeer      atomic.Bool
+	// retiredPeerEpochs prevents delayed SFU frames from rolling selection back
+	// to an epoch that has already been replaced by a newer peer process.
+	retiredPeerEpochs sync.Map
 	// initialPeerPromoted locks the first epoch change seen during SFU
 	// convergence. Telemost can keep sending the stale track after exposing the
 	// current one; feeding both epochs into one KCP runtime corrupts its state.
@@ -632,7 +635,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		// first HTTP stream is torn down before smux has a chance to settle.
 		now := time.Now().UnixNano()
 		if first := p.firstPeerAt.Load(); first != 0 && time.Duration(now-first) < 10*time.Second {
-			if !p.initialPeerPromoted.Swap(true) && p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
+			if !p.initialPeerPromoted.Swap(true) && p.promotePeerEpoch(prev, peerEpoch) {
 				logger.Infof(
 					"vp8channel: peer epoch promoted during initial grace prev=0x%08x next=0x%08x - resetting KCP",
 					prev,
@@ -649,7 +652,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 			// The carrier reconnect callback already replaced KCP. The first epoch
 			// exposed by the rejoined remote track belongs to that fresh runtime, so
 			// adopt it without tearing KCP down a second time.
-			if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
+			if p.promotePeerEpoch(prev, peerEpoch) {
 				logger.Infof("vp8channel: peer epoch accepted after local reconnect prev=0x%08x next=0x%08x - keeping fresh KCP", prev, peerEpoch)
 			}
 		} else if p.peerIngressIdle(now) {
@@ -658,7 +661,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 			// KCP runtime makes the handshake permanently incompatible. Promote only
 			// after selected-peer ingress has been idle; a live session therefore
 			// cannot be stolen by late SFU/reflected-track churn.
-			if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
+			if p.promotePeerEpoch(prev, peerEpoch) {
 				logger.Infof("vp8channel: peer epoch promoted after ingress idle prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
 				p.lastEpochReset.Store(now)
 				p.resetKCP()
@@ -687,6 +690,17 @@ func (p *streamTransport) peerIngressIdle(now int64) bool {
 	}
 	lastIngressAt := p.lastIngressAt.Load()
 	return lastIngressAt == 0 || time.Duration(now-lastIngressAt) >= peerIngressIdlePeriod
+}
+
+func (p *streamTransport) promotePeerEpoch(prev uint32, next uint32) bool {
+	if _, retired := p.retiredPeerEpochs.Load(next); retired {
+		return false
+	}
+	if !p.peerEpoch.CompareAndSwap(prev, next) {
+		return false
+	}
+	p.retiredPeerEpochs.Store(prev, struct{}{})
+	return true
 }
 
 func (p *streamTransport) shouldSuppressPeerEpochChange(now int64, lastEpochReset int64) bool {
