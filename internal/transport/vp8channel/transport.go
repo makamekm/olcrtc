@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -114,10 +115,11 @@ type streamTransport struct {
 	// localEpoch is bumped on every KCP session restart and stamped into
 	// every outgoing VP8 frame. peerEpoch tracks the last epoch we observed
 	// from the remote so we can detect their restart and reset locally.
-	bindingToken uint32
-	localEpoch   uint32
-	peerEpoch    atomic.Uint32
-	hadPeer      atomic.Bool
+	bindingToken     uint32
+	peerBindingToken uint32
+	localEpoch       uint32
+	peerEpoch        atomic.Uint32
+	hadPeer          atomic.Bool
 	// retiredPeerEpochs prevents delayed SFU frames from rolling selection back
 	// to an epoch that has already been replaced by a newer peer process.
 	retiredPeerEpochs sync.Map
@@ -171,17 +173,19 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 	fps := cfg.VP8FPS
 	batchSize := cfg.VP8BatchSize
 
+	outboundToken, peerToken := directionalBindingTokens(cfg.ClientID)
 	tr := &streamTransport{
-		stream:        stream,
-		track:         track,
-		onData:        cfg.OnData,
-		outbound:      make(chan []byte, outboundQueueSize),
-		closeCh:       make(chan struct{}),
-		writerDone:    make(chan struct{}),
-		frameInterval: time.Second / time.Duration(fps),
-		batchSize:     batchSize,
-		bindingToken:  bindingToken(cfg.ClientID),
-		localEpoch:    randomEpoch(),
+		stream:           stream,
+		track:            track,
+		onData:           cfg.OnData,
+		outbound:         make(chan []byte, outboundQueueSize),
+		closeCh:          make(chan struct{}),
+		writerDone:       make(chan struct{}),
+		frameInterval:    time.Second / time.Duration(fps),
+		batchSize:        batchSize,
+		bindingToken:     outboundToken,
+		peerBindingToken: peerToken,
+		localEpoch:       randomEpoch(),
 	}
 
 	if err := stream.AddTrack(track); err != nil {
@@ -227,6 +231,22 @@ func bindingToken(clientID string) uint32 {
 		token = 1
 	}
 	return token
+}
+
+func directionalBindingTokens(clientID string) (outbound uint32, peer uint32) {
+	identity := clientidentity.Normalize(clientID)
+	if strings.HasPrefix(clientID, "srv-") {
+		return bindingToken(identity + "\x00srv"), bindingToken(identity + "\x00cnc")
+	}
+	return bindingToken(identity + "\x00cnc"), bindingToken(identity + "\x00srv")
+}
+
+func (p *streamTransport) expectedPeerBindingToken() uint32 {
+	if p.peerBindingToken != 0 {
+		return p.peerBindingToken
+	}
+	// Tests and legacy in-package constructors use one symmetric token.
+	return p.bindingToken
 }
 
 func randomEpoch() uint32 {
@@ -610,9 +630,10 @@ func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
 // changes (peer process restart).
 func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	frameToken := binary.BigEndian.Uint32(frame[tokenOff:epochOff])
-	if frameToken != p.bindingToken {
+	expectedToken := p.expectedPeerBindingToken()
+	if frameToken != expectedToken {
 		logger.Debugf("vp8channel: frame token mismatch got=0x%08x want=0x%08x (foreign client or noise)",
-			frameToken, p.bindingToken)
+			frameToken, expectedToken)
 		return
 	}
 	peerEpoch := binary.BigEndian.Uint32(frame[epochOff:epochHdrLen])

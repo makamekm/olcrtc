@@ -369,6 +369,43 @@ func TestInitialGracePromotesOneEpochResetsKCPAndRejectsStaleFrames(t *testing.T
 	}
 }
 
+func TestDirectionalBindingTokensAcceptOnlyOppositeRole(t *testing.T) {
+	clientOut, clientPeer := directionalBindingTokens("u-makame-device-1@1700000000000")
+	serverOut, serverPeer := directionalBindingTokens("srv-u-makame-device-1")
+	if clientOut == serverOut {
+		t.Fatal("client and server outbound binding tokens must differ")
+	}
+	if clientOut != serverPeer {
+		t.Fatalf("server peer token = 0x%08x, want client outbound 0x%08x", serverPeer, clientOut)
+	}
+	if serverOut != clientPeer {
+		t.Fatalf("client peer token = 0x%08x, want server outbound 0x%08x", clientPeer, serverOut)
+	}
+
+	tr := &streamTransport{
+		bindingToken:     clientOut,
+		peerBindingToken: clientPeer,
+		localEpoch:       111,
+		outbound:         make(chan []byte, 8),
+		onData:           func([]byte) {},
+	}
+	tr.handleIncomingFrame(testVP8Frame(t, clientOut, 222, nil))
+	if tr.hadPeer.Load() {
+		t.Fatal("reflected client frame was accepted as peer traffic")
+	}
+	tr.handleIncomingFrame(testVP8Frame(t, serverOut, 333, nil))
+	if !tr.hadPeer.Load() || tr.peerEpoch.Load() != 333 {
+		t.Fatalf("server frame was not accepted: hadPeer=%v epoch=%d", tr.hadPeer.Load(), tr.peerEpoch.Load())
+	}
+	tr.kcpMu.RLock()
+	rt := tr.kcp
+	tr.kcpMu.RUnlock()
+	if rt == nil {
+		t.Fatal("accepted server frame did not start KCP")
+	}
+	rt.close()
+}
+
 func testVP8Frame(t *testing.T, token uint32, epoch uint32, payload []byte) []byte {
 	t.Helper()
 	frame := make([]byte, epochHdrLen+len(payload))

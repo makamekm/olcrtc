@@ -129,7 +129,7 @@ func TestNewConnectSendCallbacksFeaturesAndClose(t *testing.T) {
 	peerEpoch := uint32(0x200)
 	firstFrame := make([]byte, epochHdrLen+4)
 	copy(firstFrame, vp8Keepalive)
-	binary.BigEndian.PutUint32(firstFrame[tokenOff:epochOff], tr.bindingToken)
+	binary.BigEndian.PutUint32(firstFrame[tokenOff:epochOff], tr.peerBindingToken)
 	binary.BigEndian.PutUint32(firstFrame[epochOff:epochHdrLen], peerEpoch)
 	copy(firstFrame[epochHdrLen:], []byte("data"))
 	tr.handleIncomingFrame(firstFrame)
