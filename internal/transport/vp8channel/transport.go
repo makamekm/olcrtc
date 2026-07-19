@@ -115,11 +115,15 @@ type streamTransport struct {
 	// localEpoch is bumped on every KCP session restart and stamped into
 	// every outgoing VP8 frame. peerEpoch tracks the last epoch we observed
 	// from the remote so we can detect their restart and reset locally.
-	bindingToken     uint32
-	peerBindingToken uint32
-	localEpoch       uint32
-	peerEpoch        atomic.Uint32
-	hadPeer          atomic.Bool
+	bindingToken        uint32
+	peerBindingToken    uint32
+	legacyBindingToken  uint32
+	publishLegacy       bool
+	localEpoch          uint32
+	peerEpoch           atomic.Uint32
+	peerWireToken       atomic.Uint32
+	directionalPeerSeen atomic.Bool
+	hadPeer             atomic.Bool
 	// retiredPeerEpochs prevents delayed SFU frames from rolling selection back
 	// to an epoch that has already been replaced by a newer peer process.
 	retiredPeerEpochs sync.Map
@@ -174,18 +178,21 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 	batchSize := cfg.VP8BatchSize
 
 	outboundToken, peerToken := directionalBindingTokens(cfg.ClientID)
+	serverRole := strings.HasPrefix(cfg.ClientID, "srv-")
 	tr := &streamTransport{
-		stream:           stream,
-		track:            track,
-		onData:           cfg.OnData,
-		outbound:         make(chan []byte, outboundQueueSize),
-		closeCh:          make(chan struct{}),
-		writerDone:       make(chan struct{}),
-		frameInterval:    time.Second / time.Duration(fps),
-		batchSize:        batchSize,
-		bindingToken:     outboundToken,
-		peerBindingToken: peerToken,
-		localEpoch:       randomEpoch(),
+		stream:             stream,
+		track:              track,
+		onData:             cfg.OnData,
+		outbound:           make(chan []byte, outboundQueueSize),
+		closeCh:            make(chan struct{}),
+		writerDone:         make(chan struct{}),
+		frameInterval:      time.Second / time.Duration(fps),
+		batchSize:          batchSize,
+		bindingToken:       outboundToken,
+		peerBindingToken:   peerToken,
+		legacyBindingToken: bindingToken(cfg.ClientID),
+		publishLegacy:      serverRole,
+		localEpoch:         randomEpoch(),
 	}
 
 	if err := stream.AddTrack(track); err != nil {
@@ -215,9 +222,13 @@ func (p *streamTransport) Connect(ctx context.Context) error {
 // epochHeader returns the 5-byte VP8-frame header used to tag every KCP
 // packet sent in the current local session.
 func (p *streamTransport) epochHeader() [epochHdrLen]byte {
+	return p.epochHeaderForToken(p.bindingToken)
+}
+
+func (p *streamTransport) epochHeaderForToken(token uint32) [epochHdrLen]byte {
 	var hdr [epochHdrLen]byte
 	copy(hdr[:], vp8Keepalive)
-	binary.BigEndian.PutUint32(hdr[tokenOff:epochOff], p.bindingToken)
+	binary.BigEndian.PutUint32(hdr[tokenOff:epochOff], token)
 	binary.BigEndian.PutUint32(hdr[epochOff:], p.localEpoch)
 	return hdr
 }
@@ -393,6 +404,16 @@ func (p *streamTransport) writerLoop() {
 			}
 			p.outFrames.Add(1)
 			p.outBytes.Add(uint64(len(sample)))
+			if p.publishLegacy {
+				legacySample := append([]byte(nil), sample...)
+				binary.BigEndian.PutUint32(legacySample[tokenOff:epochOff], p.legacyBindingToken)
+				if err := p.track.WriteSample(media.Sample{Data: legacySample, Duration: p.frameInterval}); err != nil {
+					logger.Infof("vp8channel: legacy WriteSample failed: %v", err)
+				} else {
+					p.outFrames.Add(1)
+					p.outBytes.Add(uint64(len(legacySample)))
+				}
+			}
 			p.maybeLogStats()
 		}
 	}
@@ -631,13 +652,26 @@ func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
 func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	frameToken := binary.BigEndian.Uint32(frame[tokenOff:epochOff])
 	expectedToken := p.expectedPeerBindingToken()
-	if frameToken != expectedToken {
+	isDirectional := frameToken == expectedToken
+	isLegacy := p.publishLegacy && frameToken == p.legacyBindingToken
+	if !isDirectional && (!isLegacy || p.directionalPeerSeen.Load()) {
 		logger.Debugf("vp8channel: frame token mismatch got=0x%08x want=0x%08x (foreign client or noise)",
 			frameToken, expectedToken)
 		return
 	}
 	peerEpoch := binary.BigEndian.Uint32(frame[epochOff:epochHdrLen])
 	kcpPayload := frame[epochHdrLen:]
+	// A directional frame is authoritative. If a legacy/self/stale frame won the
+	// startup race, atomically move the session to the real directional peer and
+	// permanently reject legacy ingress for this process.
+	if p.publishLegacy && isDirectional && p.directionalPeerSeen.CompareAndSwap(false, true) && p.hadPeer.Load() && p.peerWireToken.Load() != expectedToken {
+		prev := p.peerEpoch.Swap(peerEpoch)
+		p.peerWireToken.Store(expectedToken)
+		p.retiredPeerEpochs.Store(prev, struct{}{})
+		p.lastEpochReset.Store(time.Now().UnixNano())
+		logger.Infof("vp8channel: peer upgraded from legacy to directional token prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
+		p.resetKCP()
+	}
 	// Some carriers/SFUs reflect our own published VP8 track back to us as a
 	// remote track. Those frames carry our local epoch, not the peer's. If we
 	// treat them as peer traffic, epoch tracking toggles between "self" and
@@ -648,6 +682,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	}
 
 	if !p.hadPeer.Swap(true) {
+		p.peerWireToken.Store(frameToken)
 		p.handleFirstPeer(peerEpoch)
 	} else if prev := p.peerEpoch.Load(); prev != peerEpoch {
 		// Telemost/SFU can briefly forward a stale VP8 track when a participant

@@ -406,6 +406,45 @@ func TestDirectionalBindingTokensAcceptOnlyOppositeRole(t *testing.T) {
 	rt.close()
 }
 
+func TestServerLegacyFallbackUpgradesPermanentlyToDirectionalPeer(t *testing.T) {
+	serverOut, serverPeer := directionalBindingTokens("srv-u-makame-device-1")
+	legacy := bindingToken("u-makame-device-1")
+	tr := &streamTransport{
+		bindingToken:       serverOut,
+		peerBindingToken:   serverPeer,
+		legacyBindingToken: legacy,
+		publishLegacy:      true,
+		localEpoch:         111,
+		outbound:           make(chan []byte, 8),
+		onData:             func([]byte) {},
+	}
+
+	tr.handleIncomingFrame(testVP8Frame(t, legacy, 222, nil))
+	if tr.peerEpoch.Load() != 222 || tr.peerWireToken.Load() != legacy {
+		t.Fatalf("legacy peer not accepted: epoch=%d token=0x%08x", tr.peerEpoch.Load(), tr.peerWireToken.Load())
+	}
+	tr.kcpMu.RLock()
+	legacyKCP := tr.kcp
+	tr.kcpMu.RUnlock()
+
+	tr.handleIncomingFrame(testVP8Frame(t, serverPeer, 333, nil))
+	if !tr.directionalPeerSeen.Load() || tr.peerEpoch.Load() != 333 || tr.peerWireToken.Load() != serverPeer {
+		t.Fatalf("directional upgrade failed: seen=%v epoch=%d token=0x%08x", tr.directionalPeerSeen.Load(), tr.peerEpoch.Load(), tr.peerWireToken.Load())
+	}
+	tr.kcpMu.RLock()
+	directionalKCP := tr.kcp
+	tr.kcpMu.RUnlock()
+	if directionalKCP == nil || directionalKCP == legacyKCP {
+		t.Fatal("directional upgrade did not reset KCP")
+	}
+
+	tr.handleIncomingFrame(testVP8Frame(t, legacy, 444, nil))
+	if tr.peerEpoch.Load() != 333 {
+		t.Fatalf("legacy frame replaced directional peer: epoch=%d", tr.peerEpoch.Load())
+	}
+	directionalKCP.close()
+}
+
 func testVP8Frame(t *testing.T, token uint32, epoch uint32, payload []byte) []byte {
 	t.Helper()
 	frame := make([]byte, epochHdrLen+len(payload))
