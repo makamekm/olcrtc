@@ -3,6 +3,7 @@ package client
 import (
 	"net"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -39,4 +40,22 @@ func allowBlockedEgressTargets() bool {
 
 func isBlockedEgressTarget(addr string) bool {
 	return isBlockedEgressIPv4Address(addr) || isBlockedEgressHostname(addr)
+}
+
+func isConfiguredDNSTarget(dnsServer, targetAddr string, targetPort int) bool {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(dnsServer))
+	if err != nil {
+		host = strings.TrimSpace(dnsServer)
+		portText = "53"
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port != targetPort {
+		return false
+	}
+	wantIP := net.ParseIP(strings.Trim(host, "[]"))
+	gotIP := net.ParseIP(strings.Trim(targetAddr, "[]"))
+	if wantIP != nil && gotIP != nil {
+		return wantIP.Equal(gotIP)
+	}
+	return strings.EqualFold(strings.TrimSuffix(host, "."), strings.TrimSuffix(targetAddr, "."))
 }

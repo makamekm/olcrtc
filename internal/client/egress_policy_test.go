@@ -52,3 +52,13 @@ func TestShouldServeConnectivityProbeLocally(t *testing.T) {
 		t.Fatal("example.com:80 was incorrectly recognized")
 	}
 }
+
+func TestIsConfiguredDNSTarget(t *testing.T) {
+	if !isConfiguredDNSTarget("192.168.50.53:53", "192.168.50.53", 53) {
+		t.Fatal("configured private DNS target was not allowed")
+	}
+	if isConfiguredDNSTarget("192.168.50.53:53", "192.168.50.54", 53) ||
+		isConfiguredDNSTarget("192.168.50.53:53", "192.168.50.53", 443) {
+		t.Fatal("unrelated private target was allowed")
+	}
+}

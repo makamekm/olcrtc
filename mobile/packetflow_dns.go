@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -168,19 +169,19 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int, dn
 		// only as a final fallback for networks where direct resolver access is
 		// blocked.
 		answer, directErr := packetFlowDNSResolveUDPDirect(query, dnsServer)
-		if isUsableDNSAnswer(answer, directErr) {
+		if isUsableDNSAnswer(answer, directErr, dnsServer) {
 			putCachedDNSAnswer(query, answer)
 			return answer, packetFlowDNSAnswerDirectUDP, nil
 		}
 
 		answer, tcpErr := packetFlowDNSResolveTCPDirect(query, dnsServer)
-		if isUsableDNSAnswer(answer, tcpErr) {
+		if isUsableDNSAnswer(answer, tcpErr, dnsServer) {
 			putCachedDNSAnswer(query, answer)
 			return answer, packetFlowDNSAnswerDirectTCP, nil
 		}
 
 		answer, carrierErr := packetFlowDNSResolveTCPSocks(query, socksHost, socksPort, dnsServer)
-		if isUsableDNSAnswer(answer, carrierErr) {
+		if isUsableDNSAnswer(answer, carrierErr, dnsServer) {
 			putCachedDNSAnswer(query, answer)
 			return answer, packetFlowDNSAnswerSocks, nil
 		}
@@ -194,7 +195,7 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int, dn
 		if carrierErr != nil {
 			return nil, 0, carrierErr
 		}
-		return nil, 0, errors.New("empty or synthetic dns answer")
+		return nil, 0, errors.New("empty or disallowed synthetic dns answer")
 	})
 }
 
@@ -204,8 +205,20 @@ var (
 	packetFlowDNSResolveTCPSocks  = resolveDNSOverTCPViaSocksOnce
 )
 
-func isUsableDNSAnswer(answer []byte, err error) bool {
-	return err == nil && len(answer) > 0 && !isRetryableDNSResponse(answer) && !isSyntheticDNSAnswer(answer)
+func isUsableDNSAnswer(answer []byte, err error, dnsServer string) bool {
+	if err != nil || len(answer) == 0 || isRetryableDNSResponse(answer) {
+		return false
+	}
+	return !isSyntheticDNSAnswer(answer) || isPrivateDNSResolver(dnsServer)
+}
+
+func isPrivateDNSResolver(dnsServer string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(dnsServer))
+	if err != nil {
+		host = strings.TrimSpace(dnsServer)
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsPrivate()
 }
 
 func isRetryableDNSResponse(answer []byte) bool {

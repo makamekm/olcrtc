@@ -361,7 +361,8 @@ func (c *Client) handleSocks5(_ context.Context, conn net.Conn) {
 		return
 	}
 
-	if !allowBlockedEgressTargets() && isBlockedEgressTarget(targetAddr) {
+	allowedRouterTarget := isSyntheticIPv4Address(targetAddr) || isConfiguredDNSTarget(c.dnsServer, targetAddr, targetPort)
+	if !allowBlockedEgressTargets() && isBlockedEgressTarget(targetAddr) && !allowedRouterTarget {
 		logger.Infof("reject non-public egress target locally: %s:%d", targetAddr, targetPort)
 		_, _ = conn.Write(replyHostUnreachable())
 		return

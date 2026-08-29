@@ -24,7 +24,7 @@ func TestIsBlockedEgressIPv4Address(t *testing.T) {
 		"169.254.1.1",
 		"172.16.0.1",
 		"172.31.255.254",
-		"192.168.0.209",
+		"192.168.50.54",
 		"198.18.0.1",
 	} {
 		if !isBlockedEgressIPv4Address(addr) {
@@ -38,5 +38,15 @@ func TestIsBlockedEgressIPv4AddressAllowsPublicAndHosts(t *testing.T) {
 		if isBlockedEgressIPv4Address(addr) {
 			t.Fatalf("isBlockedEgressIPv4Address(%q) = true", addr)
 		}
+	}
+}
+
+func TestIsConfiguredDNSTarget(t *testing.T) {
+	if !isConfiguredDNSTarget("192.168.50.53:53", "192.168.50.53", 53) {
+		t.Fatal("configured private DNS target was not allowed")
+	}
+	if isConfiguredDNSTarget("192.168.50.53:53", "192.168.50.54", 53) ||
+		isConfiguredDNSTarget("192.168.50.53:53", "192.168.50.53", 443) {
+		t.Fatal("unrelated private target was allowed")
 	}
 }

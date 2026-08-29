@@ -456,7 +456,8 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
 
 func (s *Server) dial(req ConnectRequest) (net.Conn, error) {
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
-	if isBlockedEgressIPv4Address(req.Addr) {
+	allowedRouterTarget := isSyntheticIPv4Address(req.Addr) || isConfiguredDNSTarget(s.dnsServer, req.Addr, req.Port)
+	if isBlockedEgressIPv4Address(req.Addr) && !allowedRouterTarget {
 		return nil, fmt.Errorf("reject non-public egress address: %s", req.Addr)
 	}
 	if s.socksProxyAddr == "" {
