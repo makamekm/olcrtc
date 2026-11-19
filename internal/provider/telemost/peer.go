@@ -963,6 +963,13 @@ func (p *Peer) handleICE(cand map[string]interface{}) {
 		return
 	}
 
+	// parts[4]/parts[5] are the media server address. Participants of one
+	// conference can land on different Telemost media nodes; logging the node
+	// makes cross-node degradation visible in production logs.
+	if parts[2] == "udp" && parts[7] == "host" && !strings.Contains(parts[4], ":") {
+		logger.Infof("telemost media node %s target=%s addr=%s:%s", sdpMid, strings.ToLower(target), parts[4], parts[5])
+	}
+
 	init := webrtc.ICECandidateInit{
 		Candidate:     candStr,
 		SDPMid:        &sdpMid,

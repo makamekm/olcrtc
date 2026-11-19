@@ -585,3 +585,32 @@ func TestSampleIntervalUsesPacingFloorForLegacyTokenFPS(t *testing.T) {
 		t.Fatalf("sampleInterval(2000) = %v, want %v", got, time.Second/2000)
 	}
 }
+
+func TestMarkFrameTypeSendsOneKeyframePerInterval(t *testing.T) {
+	tr := &streamTransport{keyframeInterval: time.Second}
+	start := time.Now()
+	frame := func(at time.Time) byte {
+		sample := append([]byte(nil), vp8Keepalive...)
+		tr.markFrameType(sample, at)
+		return sample[0] & 0x01
+	}
+	if got := frame(start); got != 0 {
+		t.Fatalf("first sample must be a keyframe, frame-type bit=%d", got)
+	}
+	if got := frame(start.Add(500 * time.Millisecond)); got != 1 {
+		t.Fatalf("sample inside interval must be an interframe, frame-type bit=%d", got)
+	}
+	if got := frame(start.Add(time.Second)); got != 0 {
+		t.Fatalf("sample after interval must be a keyframe, frame-type bit=%d", got)
+	}
+}
+
+func TestMarkFrameTypeDisabledKeepsKeyframes(t *testing.T) {
+	tr := &streamTransport{}
+	sample := append([]byte(nil), vp8Keepalive...)
+	tr.markFrameType(sample, time.Now())
+	tr.markFrameType(sample, time.Now())
+	if sample[0]&0x01 != 0 {
+		t.Fatal("disabled marking must leave keyframes untouched")
+	}
+}

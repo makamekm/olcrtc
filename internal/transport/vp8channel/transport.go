@@ -58,7 +58,7 @@ const (
 	maxDynamicBatchSize   = 64
 	canSendHighWatermark  = 90 // percent
 	keepaliveIdlePeriod   = 100 * time.Millisecond
-	peerIngressIdlePeriod = 10 * time.Second
+	peerIngressIdlePeriod = 3 * time.Second
 
 	// defaultMaxSampleBytes caps one VP8 sample so it fits into a single RTP
 	// packet (pion packetizes at a 1200-byte MTU). Telemost drops video above
@@ -69,6 +69,11 @@ const (
 	// against Telemost: ~40 KB/s at 60/s, ~300 KB/s at 600-700/s, flat above.
 	minSamplesPerSecond = 600
 	maxSampleBytesEnv   = "OLCRTC_VP8_MAX_SAMPLE_BYTES"
+	keyframeIntervalEnv = "OLCRTC_VP8_KEYFRAME_INTERVAL_MS"
+	// Telemost throttles a room to ~3 forwarded frames/s once it has carried a
+	// stream in which every frame is a keyframe; real cameras send one about
+	// every second, so do the same.
+	defaultKeyframeInterval = time.Second
 )
 
 var (
@@ -114,6 +119,8 @@ type streamTransport struct {
 	frameInterval    time.Duration
 	batchSize        int
 	maxSampleBytes   int
+	keyframeInterval time.Duration
+	lastKeyframeAt   time.Time
 	pendingMu        sync.Mutex
 	pending          []byte
 	outFrames        atomic.Uint64
@@ -204,6 +211,7 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 		frameInterval:      sampleInterval(fps),
 		batchSize:          batchSize,
 		maxSampleBytes:     maxSampleBytesFromEnv(),
+		keyframeInterval:   keyframeIntervalFromEnv(),
 		bindingToken:       outboundToken,
 		peerBindingToken:   peerToken,
 		legacyBindingToken: bindingToken(cfg.ClientID),
@@ -309,6 +317,35 @@ func maxSampleBytesFromEnv() int {
 		return defaultMaxSampleBytes
 	}
 	return value
+}
+
+// keyframeIntervalFromEnv returns how often a sample is marked as a VP8
+// keyframe; 0 (OLCRTC_VP8_KEYFRAME_INTERVAL_MS=0) marks every sample.
+func keyframeIntervalFromEnv() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(keyframeIntervalEnv))
+	if raw == "" {
+		return defaultKeyframeInterval
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return defaultKeyframeInterval
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
+// markFrameType flips the VP8 frame-type bit so that only one sample per
+// keyframeInterval claims to be a keyframe, like a real camera stream. The
+// receiver ignores the 20-byte VP8 prefix, so this is wire compatible.
+func (p *streamTransport) markFrameType(sample []byte, now time.Time) {
+	if p.keyframeInterval <= 0 || len(sample) == 0 {
+		return
+	}
+	if p.lastKeyframeAt.IsZero() || now.Sub(p.lastKeyframeAt) >= p.keyframeInterval {
+		p.lastKeyframeAt = now
+		sample[0] &^= 0x01
+		return
+	}
+	sample[0] |= 0x01
 }
 
 func (p *streamTransport) Send(data []byte) error {
@@ -482,6 +519,7 @@ func (p *streamTransport) writeFrames(frames [][]byte, lastWrite time.Time) time
 	if !lastWrite.IsZero() {
 		duration = max(now.Sub(lastWrite), time.Millisecond)
 	}
+	p.markFrameType(sample, now)
 	if err := p.track.WriteSample(media.Sample{
 		Data:     sample,
 		Duration: duration,
