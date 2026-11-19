@@ -427,6 +427,11 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
 		return
 	}
 
+	if s.shouldRouteBySNI(req) {
+		s.dispatchBySNI(stream, req)
+		return
+	}
+
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
 	logger.Infof("sid=%d connect %s", stream.ID(), addr)
 
@@ -452,6 +457,81 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
 		_ = stream.CloseWrite()
 	}()
 	_, _ = io.Copy(conn, stream)
+}
+
+// shouldRouteBySNI reports whether an HTTPS connection to a bare public IP
+// should be re-resolved by its TLS server name. Some routers send only
+// selected domains through a bypass by answering DNS with synthetic
+// 198.18.0.0/15 addresses; a client that connects to a real IP it learned
+// elsewhere (an app's own DNS cache from before the VPN, hard-coded IPs)
+// skips that bypass and fails for blocked services such as YouTube.
+func (s *Server) shouldRouteBySNI(req ConnectRequest) bool {
+	if req.Port != 443 || s.resolver == nil || s.socksProxyAddr != "" {
+		return false
+	}
+	ip := net.ParseIP(req.Addr)
+	return ip != nil && ip.To4() != nil && !isSyntheticIPv4Address(req.Addr)
+}
+
+// dispatchBySNI acknowledges the stream first so the client sends its TLS
+// ClientHello, reads the server name from it, and dials the router's
+// synthetic address for that name when the configured resolver returns one.
+// Otherwise it dials the requested IP. The ClientHello is forwarded as-is.
+func (s *Server) dispatchBySNI(stream *smux.Stream, req ConnectRequest) {
+	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
+	if _, err := stream.Write([]byte{0x00}); err != nil {
+		return
+	}
+	_ = stream.SetReadDeadline(time.Now().Add(sniPeekTimeout))
+	hello, name, _ := readClientHello(stream)
+	_ = stream.SetReadDeadline(time.Time{})
+
+	target := req
+	if name != "" {
+		if bypass := s.lookupSyntheticIPv4(name); bypass != "" {
+			target.Addr = bypass
+			logger.Infof("sid=%d connect %s sni=%s via %s", stream.ID(), addr, name, bypass)
+		} else {
+			logger.Infof("sid=%d connect %s sni=%s", stream.ID(), addr, name)
+		}
+	} else {
+		logger.Infof("sid=%d connect %s (no sni)", stream.ID(), addr)
+	}
+
+	dialStart := time.Now()
+	conn, err := s.dial(target)
+	if err != nil {
+		logger.Infof("sid=%d dial %s failed (%v): %v", stream.ID(), net.JoinHostPort(target.Addr, strconv.Itoa(target.Port)), time.Since(dialStart), err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	if len(hello) > 0 {
+		if _, err := conn.Write(hello); err != nil {
+			return
+		}
+	}
+	go func() {
+		_, _ = io.Copy(stream, conn)
+		_ = stream.CloseWrite()
+	}()
+	_, _ = io.Copy(conn, stream)
+}
+
+// lookupSyntheticIPv4 resolves name with the configured resolver and returns
+// a synthetic (router bypass) IPv4 address, or "" when there is none.
+func (s *Server) lookupSyntheticIPv4(name string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), sniPeekTimeout)
+	defer cancel()
+	ips, err := s.resolver.LookupIP(ctx, "ip4", name)
+	if err != nil {
+		return ""
+	}
+	for _, ip := range ips {
+		if isSyntheticIPv4Address(ip.String()) {
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 func (s *Server) dial(req ConnectRequest) (net.Conn, error) {
