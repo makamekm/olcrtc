@@ -103,6 +103,17 @@ const (
 	epochOff    = 24
 	epochHdrLen = 28
 	batchMagic  = 0x4f4c4342 // OLCB
+
+	// The server stamps the client session (epoch) it currently serves into
+	// the VP8 partition bytes of the prefix, which receivers otherwise ignore:
+	//	[12..16] = served client epoch, [16..18] = servedMarker
+	// After a client restart (e.g. a Wi-Fi/LTE switch) the server keeps
+	// sending its old KCP session's (re)transmissions for a few seconds until
+	// it adopts the new client epoch. Without this stamp the new client fed
+	// them into its fresh KCP and their stale ACKs wedged the new session.
+	servedEpochOff = 12
+	servedMarkOff  = 16
+	servedMarker   = 0x4f53 // OS
 )
 
 type streamTransport struct {
@@ -141,6 +152,7 @@ type streamTransport struct {
 	peerBindingToken    uint32
 	legacyBindingToken  uint32
 	publishLegacy       bool
+	serverRole          bool
 	localEpoch          uint32
 	peerEpoch           atomic.Uint32
 	peerWireToken       atomic.Uint32
@@ -216,6 +228,7 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 		peerBindingToken:   peerToken,
 		legacyBindingToken: bindingToken(cfg.ClientID),
 		publishLegacy:      serverRole,
+		serverRole:         serverRole,
 		localEpoch:         randomEpoch(),
 	}
 
@@ -346,6 +359,25 @@ func (p *streamTransport) markFrameType(sample []byte, now time.Time) {
 		return
 	}
 	sample[0] |= 0x01
+}
+
+// stampServedEpoch marks which client session a server sample belongs to.
+func (p *streamTransport) stampServedEpoch(sample []byte) {
+	if !p.serverRole || len(sample) < epochHdrLen {
+		return
+	}
+	binary.BigEndian.PutUint32(sample[servedEpochOff:servedMarkOff], p.peerEpoch.Load())
+	binary.BigEndian.PutUint16(sample[servedMarkOff:servedMarkOff+2], servedMarker)
+}
+
+// servedOtherSession reports whether a frame from a server that stamps its
+// served session was meant for another (earlier) session of this client.
+func (p *streamTransport) servedOtherSession(frame []byte) bool {
+	if p.serverRole || len(frame) < epochHdrLen ||
+		binary.BigEndian.Uint16(frame[servedMarkOff:servedMarkOff+2]) != servedMarker {
+		return false
+	}
+	return binary.BigEndian.Uint32(frame[servedEpochOff:servedMarkOff]) != p.localEpoch
 }
 
 func (p *streamTransport) Send(data []byte) error {
@@ -520,6 +552,7 @@ func (p *streamTransport) writeFrames(frames [][]byte, lastWrite time.Time) time
 		duration = max(now.Sub(lastWrite), time.Millisecond)
 	}
 	p.markFrameType(sample, now)
+	p.stampServedEpoch(sample)
 	if err := p.track.WriteSample(media.Sample{
 		Data:     sample,
 		Duration: duration,
@@ -660,8 +693,25 @@ func (p *streamTransport) buildSample(frames [][]byte) []byte {
 	return sample
 }
 
+// resetForNewPeerSession replaces KCP after the peer started a new session
+// and makes the upper layer reinstall its smux session before any frame of
+// the new session is delivered. KCP alone is not enough: the old smux
+// session keeps the previous peer's stream IDs and flow-control state, so
+// the new peer's streams were accepted but never answered (every Wi-Fi/LTE
+// switch wedged the tunnel until a full restart). Runs synchronously on the
+// ingress goroutine on purpose: data delivered into the old smux session
+// before the swap would be acknowledged by KCP and lost.
+func (p *streamTransport) resetForNewPeerSession() {
+	p.resetKCP()
+	p.reconnectMu.Lock()
+	cb := p.reconnectFn
+	p.reconnectMu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
 func (p *streamTransport) resetKCP() {
-	p.drainOutbound()
 	p.kcpMu.Lock()
 	old := p.kcp
 	p.kcp = nil
@@ -669,6 +719,9 @@ func (p *streamTransport) resetKCP() {
 	if old != nil {
 		old.close()
 	}
+	// Drain after closing so the old session cannot queue more packets that
+	// would go out stamped for the new peer session.
+	p.drainOutbound()
 	// Note: localEpoch is intentionally NOT bumped here. The epoch is a
 	// per-process identifier set once in New(). If we changed it on every
 	// peer-triggered reset, the peer would see a "new" epoch from us, reset
@@ -813,6 +866,10 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 			frameToken, expectedToken)
 		return
 	}
+	if p.servedOtherSession(frame) {
+		logger.Debugf("vp8channel: dropping server frame addressed to a previous client session")
+		return
+	}
 	peerEpoch := binary.BigEndian.Uint32(frame[epochOff:epochHdrLen])
 	kcpPayload := frame[epochHdrLen:]
 	// A directional frame is authoritative. If a legacy/self/stale frame won the
@@ -865,7 +922,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 			if p.promotePeerEpoch(prev, peerEpoch) {
 				logger.Infof("vp8channel: peer epoch accepted after local reconnect prev=0x%08x next=0x%08x - keeping fresh KCP", prev, peerEpoch)
 			}
-		} else if p.peerIngressIdle(now) {
+		} else if hadIngress := p.inFrames.Load() > 0; p.peerIngressIdle(now) {
 			// A long-lived server peer can retain a stale client track after Stop.
 			// When the next client process joins with a new epoch, keeping the old
 			// KCP runtime makes the handshake permanently incompatible. Promote only
@@ -874,7 +931,11 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 			if p.promotePeerEpoch(prev, peerEpoch) {
 				logger.Infof("vp8channel: peer epoch promoted after ingress idle prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
 				p.lastEpochReset.Store(now)
-				p.resetKCP()
+				if hadIngress {
+					p.resetForNewPeerSession()
+				} else {
+					p.resetKCP()
+				}
 			}
 		} else {
 			return

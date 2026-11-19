@@ -366,7 +366,9 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	tr.lastIngressAt.Store(time.Now().Add(-21 * time.Second).UnixNano())
 	beforeKCP = tr.kcp
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 6, []byte("frozen-ingress-remote-restart")))
-	if reconnected || tr.peerEpoch.Load() != 6 || tr.kcp == nil || tr.kcp == beforeKCP {
-		t.Fatalf("frozen ingress epoch change should be adopted with KCP reset: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+	// A peer that restarted after carrying traffic needs a fresh smux session
+	// too; with only KCP reset its new streams were accepted but never answered.
+	if !reconnected || tr.peerEpoch.Load() != 6 || tr.kcp == nil || tr.kcp == beforeKCP {
+		t.Fatalf("frozen ingress epoch change should be adopted with KCP and session reset: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
 	}
 }

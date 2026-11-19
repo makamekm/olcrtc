@@ -614,3 +614,92 @@ func TestMarkFrameTypeDisabledKeepsKeyframes(t *testing.T) {
 		t.Fatal("disabled marking must leave keyframes untouched")
 	}
 }
+
+func TestServerStampsServedClientEpoch(t *testing.T) {
+	srv := &streamTransport{serverRole: true}
+	srv.peerEpoch.Store(0xabcdef01)
+	sample := testVP8Frame(t, 1, 2, []byte("kcp"))
+	srv.stampServedEpoch(sample)
+
+	cli := &streamTransport{localEpoch: 0xabcdef01}
+	if cli.servedOtherSession(sample) {
+		t.Fatal("client dropped a frame served for its own session")
+	}
+	cli.localEpoch = 0x12345678
+	if !cli.servedOtherSession(sample) {
+		t.Fatal("client accepted a frame the server sent to a previous client session")
+	}
+	if binary.BigEndian.Uint32(sample[tokenOff:epochOff]) != 1 || binary.BigEndian.Uint32(sample[epochOff:epochHdrLen]) != 2 {
+		t.Fatal("served-epoch stamp overwrote the token or epoch")
+	}
+}
+
+func TestUnstampedServerFramesStayAccepted(t *testing.T) {
+	cli := &streamTransport{localEpoch: 0x12345678}
+	if cli.servedOtherSession(testVP8Frame(t, 1, 2, nil)) {
+		t.Fatal("frames from servers without the served-epoch stamp must be accepted")
+	}
+	srv := &streamTransport{serverRole: true}
+	if srv.servedOtherSession(testVP8Frame(t, 1, 2, nil)) {
+		t.Fatal("server must not filter client frames")
+	}
+}
+
+func TestClientDropsStaleServerSessionFrames(t *testing.T) {
+	out := make(chan []byte, 16)
+	rt, err := startKCP(out, func([]byte) {}, testEpochHdr(111))
+	if err != nil {
+		t.Fatalf("startKCP: %v", err)
+	}
+	defer rt.close()
+	cli := &streamTransport{
+		bindingToken:     bindingToken("test"),
+		peerBindingToken: bindingToken("test"),
+		outbound:         out,
+		kcp:              rt,
+		localEpoch:       111,
+	}
+	srv := &streamTransport{serverRole: true}
+	srv.peerEpoch.Store(99) // still serving the client's previous process
+	stale := testVP8Frame(t, cli.expectedPeerBindingToken(), 222, nil)
+	srv.stampServedEpoch(stale)
+
+	cli.handleIncomingFrame(stale)
+
+	if cli.hadPeer.Load() || cli.inFrames.Load() != 0 {
+		t.Fatal("client adopted a server session that was serving its previous process")
+	}
+}
+
+func TestNewPeerSessionReinstallsUpperSession(t *testing.T) {
+	out := make(chan []byte, 16)
+	rt, err := startKCP(out, func([]byte) {}, testEpochHdr(111))
+	if err != nil {
+		t.Fatalf("startKCP: %v", err)
+	}
+	tr := &streamTransport{
+		bindingToken: bindingToken("test"),
+		outbound:     out,
+		kcp:          rt,
+		localEpoch:   111,
+	}
+	tr.hadPeer.Store(true)
+	tr.peerEpoch.Store(222)
+	tr.firstPeerAt.Store(time.Now().Add(-30 * time.Second).UnixNano())
+	tr.inFrames.Store(10)
+	tr.lastIngressAt.Store(time.Now().Add(-peerIngressIdlePeriod).Add(-time.Second).UnixNano())
+	var reinstalls atomic.Int32
+	tr.reconnectFn = func() { reinstalls.Add(1) }
+
+	tr.handleIncomingFrame(testVP8Frame(t, tr.bindingToken, 333, nil))
+	tr.handleIncomingFrame(testVP8Frame(t, tr.bindingToken, 333, nil))
+
+	if got := reinstalls.Load(); got != 1 {
+		t.Fatalf("upper session reinstalls = %d, want exactly 1 for one new peer session", got)
+	}
+	tr.kcpMu.RLock()
+	defer tr.kcpMu.RUnlock()
+	if tr.kcp != nil {
+		tr.kcp.close()
+	}
+}
