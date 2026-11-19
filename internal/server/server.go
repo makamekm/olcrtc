@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
 	"io"
 	"net"
 	"strconv"
@@ -541,7 +542,7 @@ func (s *Server) lookupSyntheticIPv4(name string) string {
 
 func (s *Server) dial(req ConnectRequest) (net.Conn, error) {
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
-	allowedRouterTarget := isSyntheticIPv4Address(req.Addr) || isConfiguredDNSTarget(s.dnsServer, req.Addr, req.Port)
+	allowedRouterTarget := isSyntheticIPv4Address(req.Addr) || isConfiguredDNSTarget(s.dnsServer, req.Addr, req.Port) || lanaccess.Contains(req.Addr)
 	if isBlockedEgressIPv4Address(req.Addr) && !allowedRouterTarget {
 		return nil, fmt.Errorf("reject non-public egress address: %s", req.Addr)
 	}

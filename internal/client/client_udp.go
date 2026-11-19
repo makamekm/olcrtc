@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
 	"io"
 	"net"
 	"sync"
@@ -140,6 +141,9 @@ func (c *Client) handleUDPAssociate(control net.Conn) {
 }
 
 func normalizeUDPTarget(targetAddr string, targetPort int) (string, bool) {
+	if lanaccess.Contains(targetAddr) {
+		return targetAddr, true
+	}
 	if targetPort == 53 {
 		if isBlockedEgressIPv4Address(targetAddr) {
 			logger.Debugf("udp DNS target %s:%d rewritten to 1.1.1.1:53", targetAddr, targetPort)

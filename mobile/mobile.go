@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
 	"io"
 	"log"
 	"net/http"
@@ -133,6 +134,13 @@ func SetDNS(dnsServer string) {
 	defer mu.Unlock()
 	ensureDefaultConfigLocked()
 	defaults.dnsServer = dnsServer
+}
+
+// SetLANSubnets exposes the server's local network through the tunnel:
+// comma-separated private CIDRs (e.g. "192.168.0.0/24"), "" to disable.
+// Must match the subnets the server allows.
+func SetLANSubnets(spec string) {
+	lanaccess.Set(spec)
 }
 
 // SetVP8Options configures vp8channel.

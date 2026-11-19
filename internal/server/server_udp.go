@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
 	"io"
 	"net"
 	"strconv"
@@ -17,7 +18,7 @@ func (s *Server) dispatchUDP(stream *smux.Stream, req ConnectRequest) {
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
 	logger.Debugf("sid=%d udp %s", stream.ID(), addr)
 
-	if isBlockedEgressIPv4Address(req.Addr) {
+	if isBlockedEgressIPv4Address(req.Addr) && !lanaccess.Contains(req.Addr) {
 		logger.Infof("sid=%d udp %s rejected: non-public egress address", stream.ID(), addr)
 		_, _ = stream.Write([]byte{0x01})
 		return

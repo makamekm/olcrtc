@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
 	"io"
 	"net"
 	"sync"
@@ -361,7 +362,7 @@ func (c *Client) handleSocks5(_ context.Context, conn net.Conn) {
 		return
 	}
 
-	allowedRouterTarget := isSyntheticIPv4Address(targetAddr) || isConfiguredDNSTarget(c.dnsServer, targetAddr, targetPort)
+	allowedRouterTarget := isSyntheticIPv4Address(targetAddr) || isConfiguredDNSTarget(c.dnsServer, targetAddr, targetPort) || lanaccess.Contains(targetAddr)
 	if !allowBlockedEgressTargets() && isBlockedEgressTarget(targetAddr) && !allowedRouterTarget {
 		logger.Infof("reject non-public egress target locally: %s:%d", targetAddr, targetPort)
 		_, _ = conn.Write(replyHostUnreachable())
