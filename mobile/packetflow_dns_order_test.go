@@ -3,6 +3,7 @@ package mobile
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestPacketFlowDNSPrefersDirectUDPBeforeCarrierSocks(t *testing.T) {
@@ -112,4 +113,44 @@ func stringSliceJoin(values []string) string {
 		out += value + "\x00"
 	}
 	return out
+}
+
+func TestPacketFlowDNSHedgesToSocksWhenDirectResolverHangs(t *testing.T) {
+	clearPacketFlowDNSCache()
+	t.Cleanup(clearPacketFlowDNSCache)
+	oldUDP := packetFlowDNSResolveUDPDirect
+	oldTCP := packetFlowDNSResolveTCPDirect
+	oldSocks := packetFlowDNSResolveTCPSocks
+	t.Cleanup(func() {
+		packetFlowDNSResolveUDPDirect = oldUDP
+		packetFlowDNSResolveTCPDirect = oldTCP
+		packetFlowDNSResolveTCPSocks = oldSocks
+	})
+
+	query := dnsPayloadFromQueryPacket(dnsQueryPacket("rr3---sn-n8v7knl6.googlevideo.com", 1), t)
+	socksAnswer := dnsAnswerPayload(query)
+	// A private LAN resolver seen from LTE: direct attempts just time out.
+	packetFlowDNSResolveUDPDirect = func([]byte, string) ([]byte, error) {
+		time.Sleep(packetFlowDNSDirectTimeout)
+		return nil, errors.New("udp timeout")
+	}
+	packetFlowDNSResolveTCPDirect = func([]byte, string) ([]byte, error) {
+		time.Sleep(packetFlowDNSDirectTimeout)
+		return nil, errors.New("tcp timeout")
+	}
+	packetFlowDNSResolveTCPSocks = func([]byte, string, int, string) ([]byte, error) {
+		return socksAnswer, nil
+	}
+
+	start := time.Now()
+	answer, source, err := resolveDNSOverTCPViaSocks(query, "127.0.0.1", 10808, "192.168.0.191:53")
+	if err != nil {
+		t.Fatalf("resolveDNSOverTCPViaSocks error = %v", err)
+	}
+	if string(answer) != string(socksAnswer) || source != packetFlowDNSAnswerSocks {
+		t.Fatalf("expected the SOCKS answer, got source=%v", source)
+	}
+	if elapsed := time.Since(start); elapsed >= packetFlowDNSDirectTimeout {
+		t.Fatalf("hedged lookup took %v; must not wait for the direct timeouts", elapsed)
+	}
 }

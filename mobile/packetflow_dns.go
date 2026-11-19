@@ -161,42 +161,93 @@ func resolveDNSOverTCPViaSocks(query []byte, socksHost string, socksPort int, dn
 		}
 
 		// Packet-flow DNS is on the critical path for user-visible app
-		// navigation. YouTube Shorts creates fresh googlevideo hostnames on
-		// each swipe; trying carrier/SOCKS DNS first can burn the 5s SOCKS DNS
-		// timeout per uncached hostname before the fast resolver is attempted.
-		// The iOS tunnel settings exclude the configured resolver address from
-		// VPN routing, so direct UDP/TCP is the low-latency path. Keep SOCKS DNS
-		// only as a final fallback for networks where direct resolver access is
-		// blocked.
-		answer, directErr := packetFlowDNSResolveUDPDirect(query, dnsServer)
-		if isUsableDNSAnswer(answer, directErr, dnsServer) {
-			putCachedDNSAnswer(query, answer)
-			return answer, packetFlowDNSAnswerDirectUDP, nil
-		}
-
-		answer, tcpErr := packetFlowDNSResolveTCPDirect(query, dnsServer)
-		if isUsableDNSAnswer(answer, tcpErr, dnsServer) {
-			putCachedDNSAnswer(query, answer)
-			return answer, packetFlowDNSAnswerDirectTCP, nil
-		}
-
-		answer, carrierErr := packetFlowDNSResolveTCPSocks(query, socksHost, socksPort, dnsServer)
-		if isUsableDNSAnswer(answer, carrierErr, dnsServer) {
-			putCachedDNSAnswer(query, answer)
-			return answer, packetFlowDNSAnswerSocks, nil
-		}
-
-		if directErr != nil {
-			return nil, 0, directErr
-		}
-		if tcpErr != nil {
-			return nil, 0, tcpErr
-		}
-		if carrierErr != nil {
-			return nil, 0, carrierErr
-		}
-		return nil, 0, errors.New("empty or disallowed synthetic dns answer")
+		// navigation (YouTube Shorts creates fresh googlevideo hostnames on
+		// each swipe). The configured resolver is excluded from VPN routing,
+		// so direct UDP/TCP is the fast path at home. On another network
+		// (e.g. LTE) a private LAN resolver is unreachable directly and only
+		// works through the tunnel; waiting for both direct timeouts first
+		// added ~0.6 s to every new hostname. Race them happy-eyeballs style:
+		// direct first, SOCKS after a short head start or as soon as direct
+		// fails; the first usable answer wins.
+		return resolveDNSHedged(query, socksHost, socksPort, dnsServer)
 	})
+}
+
+const packetFlowDNSSocksHedgeDelay = 150 * time.Millisecond
+
+type packetFlowDNSAttempt struct {
+	answer []byte
+	source packetFlowDNSAnswerSource
+	err    error
+}
+
+func resolveDNSHedged(query []byte, socksHost string, socksPort int, dnsServer string) ([]byte, packetFlowDNSAnswerSource, error) {
+	// Capture the resolvers: a losing attempt keeps running after we return.
+	resolveUDP, resolveTCP, resolveSocks := packetFlowDNSResolveUDPDirect, packetFlowDNSResolveTCPDirect, packetFlowDNSResolveTCPSocks
+	results := make(chan packetFlowDNSAttempt, 2)
+	go func() {
+		answer, udpErr := resolveUDP(query, dnsServer)
+		if isUsableDNSAnswer(answer, udpErr, dnsServer) {
+			results <- packetFlowDNSAttempt{answer: answer, source: packetFlowDNSAnswerDirectUDP}
+			return
+		}
+		answer, tcpErr := resolveTCP(query, dnsServer)
+		if isUsableDNSAnswer(answer, tcpErr, dnsServer) {
+			results <- packetFlowDNSAttempt{answer: answer, source: packetFlowDNSAnswerDirectTCP}
+			return
+		}
+		results <- packetFlowDNSAttempt{err: firstDNSError(udpErr, tcpErr)}
+	}()
+
+	socksStarted := false
+	startSocks := func() {
+		socksStarted = true
+		go func() {
+			answer, err := resolveSocks(query, socksHost, socksPort, dnsServer)
+			if isUsableDNSAnswer(answer, err, dnsServer) {
+				results <- packetFlowDNSAttempt{answer: answer, source: packetFlowDNSAnswerSocks}
+				return
+			}
+			results <- packetFlowDNSAttempt{err: firstDNSError(err)}
+		}()
+	}
+
+	hedge := time.NewTimer(packetFlowDNSSocksHedgeDelay)
+	defer hedge.Stop()
+	pending := 1
+	var firstErr error
+	for pending > 0 {
+		select {
+		case <-hedge.C:
+			if !socksStarted {
+				startSocks()
+				pending++
+			}
+		case r := <-results:
+			pending--
+			if r.err == nil {
+				putCachedDNSAnswer(query, r.answer)
+				return r.answer, r.source, nil
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			if !socksStarted {
+				startSocks()
+				pending++
+			}
+		}
+	}
+	return nil, 0, firstErr
+}
+
+func firstDNSError(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return errors.New("empty or disallowed synthetic dns answer")
 }
 
 var (
