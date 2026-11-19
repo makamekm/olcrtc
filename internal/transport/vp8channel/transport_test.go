@@ -144,9 +144,9 @@ func testEpochHdr(epoch uint32) [epochHdrLen]byte {
 func TestHandleIncomingFrameIgnoresLoopedBackLocalEpoch(t *testing.T) {
 	tr := &streamTransport{
 		bindingToken: bindingToken("test"),
-		localEpoch:   12345,
 		onData:       func([]byte) {},
 	}
+	tr.setLocalEpoch(12345)
 
 	var called atomic.Int32
 	tr.reconnectFn = func() { called.Add(1) }
@@ -154,7 +154,7 @@ func TestHandleIncomingFrameIgnoresLoopedBackLocalEpoch(t *testing.T) {
 	frame := make([]byte, epochHdrLen+4)
 	copy(frame, vp8Keepalive)
 	binary.BigEndian.PutUint32(frame[tokenOff:epochOff], tr.bindingToken)
-	binary.BigEndian.PutUint32(frame[epochOff:], tr.localEpoch)
+	binary.BigEndian.PutUint32(frame[epochOff:], tr.localEpoch.Load())
 	copy(frame[epochHdrLen:], []byte{1, 2, 3, 4})
 
 	tr.handleIncomingFrame(frame)
@@ -173,9 +173,9 @@ func TestHandleIncomingFrameIgnoresLoopedBackLocalEpoch(t *testing.T) {
 func TestHandleIncomingFrameIgnoresForeignBindingToken(t *testing.T) {
 	tr := &streamTransport{
 		bindingToken: bindingToken("srv-client"),
-		localEpoch:   12345,
 		onData:       func([]byte) {},
 	}
+	tr.setLocalEpoch(12345)
 
 	var called atomic.Int32
 	tr.reconnectFn = func() { called.Add(1) }
@@ -208,10 +208,10 @@ func TestZeroIngressEpochChangePromotesPeerAndResetsKCP(t *testing.T) {
 
 	tr := &streamTransport{
 		bindingToken: bindingToken("test"),
-		localEpoch:   111,
 		outbound:     out,
 		kcp:          rt,
 	}
+	tr.setLocalEpoch(111)
 	tr.hadPeer.Store(true)
 	tr.peerEpoch.Store(222)
 	tr.firstPeerAt.Store(time.Now().Add(-30 * time.Second).UnixNano())
@@ -248,10 +248,10 @@ func TestIdlePostIngressEpochChangePromotesPeerAndResetsKCP(t *testing.T) {
 	}
 	tr := &streamTransport{
 		bindingToken: bindingToken("test"),
-		localEpoch:   111,
 		outbound:     out,
 		kcp:          rt,
 	}
+	tr.setLocalEpoch(111)
 	tr.hadPeer.Store(true)
 	tr.peerEpoch.Store(222)
 	tr.firstPeerAt.Store(time.Now().Add(-30 * time.Second).UnixNano())
@@ -283,10 +283,10 @@ func TestPostIngressEpochChangeKeepsKCP(t *testing.T) {
 
 	tr := &streamTransport{
 		bindingToken: bindingToken("test"),
-		localEpoch:   111,
 		outbound:     out,
 		kcp:          rt,
 	}
+	tr.setLocalEpoch(111)
 	tr.hadPeer.Store(true)
 	tr.peerEpoch.Store(222)
 	tr.firstPeerAt.Store(time.Now().Add(-30 * time.Second).UnixNano())
@@ -319,10 +319,10 @@ func TestInitialGracePromotesOneEpochResetsKCPAndRejectsStaleFrames(t *testing.T
 	out := make(chan []byte, 32)
 	tr := &streamTransport{
 		bindingToken: bindingToken("test"),
-		localEpoch:   111,
 		outbound:     out,
 		onData:       func([]byte) {},
 	}
+	tr.setLocalEpoch(111)
 
 	tr.handleIncomingFrame(testVP8Frame(t, tr.bindingToken, 222, nil))
 	tr.kcpMu.RLock()
@@ -385,10 +385,10 @@ func TestDirectionalBindingTokensAcceptOnlyOppositeRole(t *testing.T) {
 	tr := &streamTransport{
 		bindingToken:     clientOut,
 		peerBindingToken: clientPeer,
-		localEpoch:       111,
 		outbound:         make(chan []byte, 8),
 		onData:           func([]byte) {},
 	}
+	tr.setLocalEpoch(111)
 	tr.handleIncomingFrame(testVP8Frame(t, clientOut, 222, nil))
 	if tr.hadPeer.Load() {
 		t.Fatal("reflected client frame was accepted as peer traffic")
@@ -414,10 +414,10 @@ func TestServerLegacyFallbackUpgradesPermanentlyToDirectionalPeer(t *testing.T) 
 		peerBindingToken:   serverPeer,
 		legacyBindingToken: legacy,
 		publishLegacy:      true,
-		localEpoch:         111,
 		outbound:           make(chan []byte, 8),
 		onData:             func([]byte) {},
 	}
+	tr.setLocalEpoch(111)
 
 	tr.handleIncomingFrame(testVP8Frame(t, legacy, 222, nil))
 	if tr.peerEpoch.Load() != 222 || tr.peerWireToken.Load() != legacy {
@@ -543,10 +543,10 @@ func TestIdleKeepaliveFromPeerCountsAsIngress(t *testing.T) {
 	tr := &streamTransport{
 		bindingToken:     out,
 		peerBindingToken: peer,
-		localEpoch:       111,
 		outbound:         make(chan []byte, 8),
 		onData:           func([]byte) {},
 	}
+	tr.setLocalEpoch(111)
 	defer func() {
 		tr.kcpMu.RLock()
 		rt := tr.kcp
@@ -621,11 +621,12 @@ func TestServerStampsServedClientEpoch(t *testing.T) {
 	sample := testVP8Frame(t, 1, 2, []byte("kcp"))
 	srv.stampServedEpoch(sample)
 
-	cli := &streamTransport{localEpoch: 0xabcdef01}
+	cli := &streamTransport{}
+	cli.setLocalEpoch(0xabcdef01)
 	if cli.servedOtherSession(sample) {
 		t.Fatal("client dropped a frame served for its own session")
 	}
-	cli.localEpoch = 0x12345678
+	cli.setLocalEpoch(0x12345678)
 	if !cli.servedOtherSession(sample) {
 		t.Fatal("client accepted a frame the server sent to a previous client session")
 	}
@@ -635,7 +636,8 @@ func TestServerStampsServedClientEpoch(t *testing.T) {
 }
 
 func TestUnstampedServerFramesStayAccepted(t *testing.T) {
-	cli := &streamTransport{localEpoch: 0x12345678}
+	cli := &streamTransport{}
+	cli.setLocalEpoch(0x12345678)
 	if cli.servedOtherSession(testVP8Frame(t, 1, 2, nil)) {
 		t.Fatal("frames from servers without the served-epoch stamp must be accepted")
 	}
@@ -657,8 +659,8 @@ func TestClientDropsStaleServerSessionFrames(t *testing.T) {
 		peerBindingToken: bindingToken("test"),
 		outbound:         out,
 		kcp:              rt,
-		localEpoch:       111,
 	}
+	cli.setLocalEpoch(111)
 	srv := &streamTransport{serverRole: true}
 	srv.peerEpoch.Store(99) // still serving the client's previous process
 	stale := testVP8Frame(t, cli.expectedPeerBindingToken(), 222, nil)
@@ -681,8 +683,8 @@ func TestNewPeerSessionReinstallsUpperSession(t *testing.T) {
 		bindingToken: bindingToken("test"),
 		outbound:     out,
 		kcp:          rt,
-		localEpoch:   111,
 	}
+	tr.setLocalEpoch(111)
 	tr.hadPeer.Store(true)
 	tr.peerEpoch.Store(222)
 	tr.firstPeerAt.Store(time.Now().Add(-30 * time.Second).UnixNano())

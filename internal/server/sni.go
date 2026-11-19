@@ -1,11 +1,14 @@
 package server
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"time"
+
+	"github.com/openlibrecommunity/olcrtc/internal/logger"
 )
 
 const (
@@ -17,6 +20,52 @@ const (
 )
 
 var errNoSNI = errors.New("no TLS server name")
+
+// syntheticDNSProbeNames are domains that fake-IP bypass routers route
+// through their bypass; a synthetic answer for any of them means the
+// configured resolver is such a router.
+var syntheticDNSProbeNames = []string{"www.youtube.com", "youtube.com"} //nolint:gochecknoglobals // probe list
+
+const syntheticDNSProbeInterval = 10 * time.Minute
+
+// probeSyntheticDNS turns SNI routing on only where it helps. On a plain
+// cloud server the resolver returns real addresses, routing by SNI would only
+// add a DNS lookup to every HTTPS connection, so it stays off. Behind a
+// fake-IP bypass router (custom LAN DNS) it switches on. Re-checked
+// periodically in case the resolver changes behaviour.
+func (s *Server) probeSyntheticDNS(ctx context.Context) {
+	for {
+		enabled := s.resolverReturnsSynthetic(ctx)
+		if s.sniRouting.Swap(enabled) != enabled {
+			logger.Infof("server: SNI routing for HTTPS to bare IPs %s (dns=%s)", map[bool]string{true: "enabled", false: "disabled"}[enabled], s.dnsServer)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(syntheticDNSProbeInterval):
+		}
+	}
+}
+
+func (s *Server) resolverReturnsSynthetic(ctx context.Context) bool {
+	if s.resolver == nil {
+		return false
+	}
+	for _, name := range syntheticDNSProbeNames {
+		lookupCtx, cancel := context.WithTimeout(ctx, sniPeekTimeout)
+		ips, err := s.resolver.LookupIP(lookupCtx, "ip4", name)
+		cancel()
+		if err != nil {
+			continue
+		}
+		for _, ip := range ips {
+			if isSyntheticIPv4Address(ip.String()) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // readClientHello reads one complete TLS record from r when it starts like a
 // TLS handshake. It returns whatever bytes were read (so the caller can

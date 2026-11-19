@@ -186,13 +186,13 @@ func TestEpochHeaderTokenAndOutboundCapacity(t *testing.T) {
 		closeCh:      make(chan struct{}),
 		writerDone:   make(chan struct{}),
 		bindingToken: bindingToken("client"),
-		localEpoch:   0x01020304,
 	}
+	tr.setLocalEpoch(0x01020304)
 
 	hdr := tr.epochHeader()
 	if !bytes.Equal(hdr[:tokenOff], vp8Keepalive) ||
 		binary.BigEndian.Uint32(hdr[tokenOff:epochOff]) != tr.bindingToken ||
-		binary.BigEndian.Uint32(hdr[epochOff:]) != tr.localEpoch {
+		binary.BigEndian.Uint32(hdr[epochOff:]) != tr.localEpoch.Load() {
 		t.Fatalf("epochHeader() = %x", hdr)
 	}
 	if bindingToken("") == 0 || randomEpoch() == 0 {
@@ -290,9 +290,9 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 		closeCh:      make(chan struct{}),
 		writerDone:   make(chan struct{}),
 		bindingToken: bindingToken("client"),
-		localEpoch:   0x100,
 		onData:       func([]byte) { called++ },
 	}
+	tr.setLocalEpoch(0x100)
 	defer func() {
 		_ = tr.Close()
 	}()
@@ -307,7 +307,7 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	}
 
 	tr.handleIncomingFrame(mkFrame(bindingToken("other"), 1, []byte("x")))
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, tr.localEpoch, []byte("self")))
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, tr.localEpoch.Load(), []byte("self")))
 	if tr.hadPeer.Load() || called != 0 {
 		t.Fatal("filtered frames changed peer state")
 	}
@@ -326,9 +326,18 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	if stream.reconnect == nil {
 		t.Fatal("SetReconnectCallback did not install stream callback")
 	}
+	epochBeforeReconnect := tr.localEpoch.Load()
 	stream.reconnect()
 	if !reconnected || tr.kcp == nil {
 		t.Fatalf("stream reconnect did not reset/callback: reconnected=%v kcp=%v", reconnected, tr.kcp)
+	}
+	// A local carrier reconnect restarts KCP from zero, so it must also start a
+	// new session epoch; under the old one the peer discards the new segments.
+	if tr.localEpoch.Load() == epochBeforeReconnect {
+		t.Fatal("local carrier reconnect kept the old session epoch")
+	}
+	if !tr.isOwnEpoch(epochBeforeReconnect) {
+		t.Fatal("previous local epoch must still be recognised as self-echo")
 	}
 	reconnected = false
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 2, []byte("initial-switch")))

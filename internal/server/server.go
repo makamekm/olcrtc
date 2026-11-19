@@ -11,6 +11,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/clientidentity"
@@ -54,6 +55,9 @@ type Server struct {
 	resolver        *net.Resolver
 	socksProxyAddr  string
 	socksProxyPort  int
+	// sniRouting is on while the configured resolver answers with router
+	// bypass (synthetic 198.18.0.0/15) addresses; see probeSyntheticDNS.
+	sniRouting atomic.Bool
 }
 
 // ConnectRequest is a message from the client to establish a new connection.
@@ -109,6 +113,7 @@ func Run(
 		socksProxyPort: socksProxyPort,
 	}
 	s.setupResolver()
+	go s.probeSyntheticDNS(runCtx)
 
 	if err := s.bringUpLink(
 		runCtx, linkName, transportName, carrierName, roomURL, cancel,
@@ -466,7 +471,7 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
 // elsewhere (an app's own DNS cache from before the VPN, hard-coded IPs)
 // skips that bypass and fails for blocked services such as YouTube.
 func (s *Server) shouldRouteBySNI(req ConnectRequest) bool {
-	if req.Port != 443 || s.resolver == nil || s.socksProxyAddr != "" {
+	if req.Port != 443 || s.resolver == nil || s.socksProxyAddr != "" || !s.sniRouting.Load() {
 		return false
 	}
 	ip := net.ParseIP(req.Addr)
