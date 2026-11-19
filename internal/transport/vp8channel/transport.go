@@ -32,6 +32,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +59,16 @@ const (
 	canSendHighWatermark  = 90 // percent
 	keepaliveIdlePeriod   = 100 * time.Millisecond
 	peerIngressIdlePeriod = 10 * time.Second
+
+	// defaultMaxSampleBytes caps one VP8 sample so it fits into a single RTP
+	// packet (pion packetizes at a 1200-byte MTU). Telemost drops video above
+	// roughly 1 Mbit/s per subscriber; a multi-packet sample loses every byte
+	// when any one of its packets is dropped, so large batches collapse KCP.
+	defaultMaxSampleBytes = 1100
+	// minSamplesPerSecond is the pacing floor for one-packet samples. Measured
+	// against Telemost: ~40 KB/s at 60/s, ~300 KB/s at 600-700/s, flat above.
+	minSamplesPerSecond = 600
+	maxSampleBytesEnv   = "OLCRTC_VP8_MAX_SAMPLE_BYTES"
 )
 
 var (
@@ -101,6 +113,9 @@ type streamTransport struct {
 	kcpOnce          sync.Once
 	frameInterval    time.Duration
 	batchSize        int
+	maxSampleBytes   int
+	pendingMu        sync.Mutex
+	pending          []byte
 	outFrames        atomic.Uint64
 	outBytes         atomic.Uint64
 	inFrames         atomic.Uint64
@@ -186,8 +201,9 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 		outbound:           make(chan []byte, outboundQueueSize),
 		closeCh:            make(chan struct{}),
 		writerDone:         make(chan struct{}),
-		frameInterval:      time.Second / time.Duration(fps),
+		frameInterval:      sampleInterval(fps),
 		batchSize:          batchSize,
+		maxSampleBytes:     maxSampleBytesFromEnv(),
 		bindingToken:       outboundToken,
 		peerBindingToken:   peerToken,
 		legacyBindingToken: bindingToken(cfg.ClientID),
@@ -274,6 +290,27 @@ func randomEpoch() uint32 {
 	return e
 }
 
+// sampleInterval converts the configured vp8-fps into the minimum spacing
+// between samples. Samples are single-RTP-packet sized, so the rate is the
+// tunnel's packet budget: Telemost forwards a few hundred such packets per
+// second, while the 25-60 fps values baked into existing connection tokens
+// would cap the tunnel at ~60 KB/s. Those values are treated as a floor.
+func sampleInterval(fps int) time.Duration {
+	return time.Second / time.Duration(max(fps, minSamplesPerSecond))
+}
+
+func maxSampleBytesFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv(maxSampleBytesEnv))
+	if raw == "" {
+		return defaultMaxSampleBytes
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return defaultMaxSampleBytes
+	}
+	return value
+}
+
 func (p *streamTransport) Send(data []byte) error {
 	if p.closed.Load() {
 		return ErrTransportClosed
@@ -311,6 +348,9 @@ func (p *streamTransport) Close() error {
 }
 
 func (p *streamTransport) drainOutbound() {
+	p.pendingMu.Lock()
+	p.pending = nil
+	p.pendingMu.Unlock()
 	for {
 		select {
 		case <-p.outbound:
@@ -371,52 +411,101 @@ func (p *streamTransport) Features() transport.Features {
 func (p *streamTransport) writerLoop() {
 	defer close(p.writerDone)
 
-	ticker := time.NewTicker(p.frameInterval)
-	defer ticker.Stop()
-
-	keepaliveEvery := max(int(keepaliveIdlePeriod/p.frameInterval), 1)
-	idleTicks := 0
+	keepalive := time.NewTimer(keepaliveIdlePeriod)
+	defer keepalive.Stop()
+	var lastWrite time.Time
 
 	for {
+		var frames [][]byte
+		if p.hasQueuedOutbound() {
+			frames = p.pacedOutboundBatch(lastWrite)
+		} else {
+			select {
+			case <-p.closeCh:
+				return
+			case frame := <-p.outbound:
+				p.deferOutbound(frame)
+				frames = p.pacedOutboundBatch(lastWrite)
+			case <-keepalive.C:
+				frames = [][]byte{p.buildIdleFrame()}
+			}
+		}
+		if p.closed.Load() {
+			return
+		}
+		if len(frames) == 0 {
+			// drainOutbound raced with us after a KCP reset.
+			continue
+		}
+
+		lastWrite = p.writeFrames(frames, lastWrite)
+		keepalive.Reset(keepaliveIdlePeriod)
+	}
+}
+
+func (p *streamTransport) hasQueuedOutbound() bool {
+	p.pendingMu.Lock()
+	pending := p.pending != nil
+	p.pendingMu.Unlock()
+	return pending || len(p.outbound) > 0
+}
+
+// deferOutbound parks a frame taken off the queue so collectOutboundBatch
+// sends it first. Only the writer calls it, and only when nothing is parked.
+func (p *streamTransport) deferOutbound(frame []byte) {
+	p.pendingMu.Lock()
+	p.pending = frame
+	p.pendingMu.Unlock()
+}
+
+// pacedOutboundBatch waits until frameInterval has passed since the previous
+// sample, then collects whatever accumulated in the meantime.
+func (p *streamTransport) pacedOutboundBatch(lastWrite time.Time) [][]byte {
+	if wait := p.frameInterval - time.Since(lastWrite); wait > 0 && !lastWrite.IsZero() {
+		timer := time.NewTimer(wait)
 		select {
 		case <-p.closeCh:
-			return
-		case <-ticker.C:
-			frames := p.collectOutboundBatch()
-			if len(frames) == 0 {
-				idleTicks++
-				if idleTicks < keepaliveEvery {
-					continue
-				}
-				idleTicks = 0
-				frames = [][]byte{p.buildIdleFrame()}
-			} else {
-				idleTicks = 0
-			}
-
-			sample := p.buildSample(frames)
-			if err := p.track.WriteSample(media.Sample{
-				Data:     sample,
-				Duration: p.frameInterval,
-			}); err != nil {
-				logger.Infof("vp8channel: WriteSample failed: %v", err)
-				continue
-			}
-			p.outFrames.Add(1)
-			p.outBytes.Add(uint64(len(sample)))
-			if p.publishLegacy {
-				legacySample := append([]byte(nil), sample...)
-				binary.BigEndian.PutUint32(legacySample[tokenOff:epochOff], p.legacyBindingToken)
-				if err := p.track.WriteSample(media.Sample{Data: legacySample, Duration: p.frameInterval}); err != nil {
-					logger.Infof("vp8channel: legacy WriteSample failed: %v", err)
-				} else {
-					p.outFrames.Add(1)
-					p.outBytes.Add(uint64(len(legacySample)))
-				}
-			}
-			p.maybeLogStats()
+			timer.Stop()
+			return nil
+		case <-timer.C:
 		}
 	}
+	return p.collectOutboundBatch()
+}
+
+func (p *streamTransport) writeFrames(frames [][]byte, lastWrite time.Time) time.Time {
+	sample := p.buildSample(frames)
+	// RTP timestamps must follow wall-clock time: samples are sent on demand,
+	// so a fixed per-sample duration would drift away from real time.
+	now := time.Now()
+	duration := p.frameInterval
+	if !lastWrite.IsZero() {
+		duration = max(now.Sub(lastWrite), time.Millisecond)
+	}
+	if err := p.track.WriteSample(media.Sample{
+		Data:     sample,
+		Duration: duration,
+	}); err != nil {
+		logger.Infof("vp8channel: WriteSample failed: %v", err)
+		return now
+	}
+	p.outFrames.Add(1)
+	p.outBytes.Add(uint64(len(sample)))
+	// Legacy (pre-directional) clients need a copy stamped with the symmetric
+	// token. Once a directional peer is seen, legacy ingress is rejected for
+	// the rest of this process, so the copy would only double egress.
+	if p.publishLegacy && !p.directionalPeerSeen.Load() {
+		legacySample := append([]byte(nil), sample...)
+		binary.BigEndian.PutUint32(legacySample[tokenOff:epochOff], p.legacyBindingToken)
+		if err := p.track.WriteSample(media.Sample{Data: legacySample, Duration: time.Millisecond}); err != nil {
+			logger.Infof("vp8channel: legacy WriteSample failed: %v", err)
+		} else {
+			p.outFrames.Add(1)
+			p.outBytes.Add(uint64(len(legacySample)))
+		}
+	}
+	p.maybeLogStats()
+	return now
 }
 
 func (p *streamTransport) buildIdleFrame() []byte {
@@ -449,10 +538,37 @@ func (p *streamTransport) maybeLogStats() {
 func (p *streamTransport) collectOutboundBatch() [][]byte {
 	limit := p.dynamicBatchLimit()
 	frames := make([][]byte, 0, limit)
+	size := epochHdrLen + 6
+
+	// add appends frame unless doing so would push the sample past
+	// maxSampleBytes; a lone frame is always accepted.
+	add := func(frame []byte) bool {
+		next := size + 2 + len(frame) - epochHdrLen
+		if len(frames) > 0 && p.maxSampleBytes > 0 && next > p.maxSampleBytes {
+			return false
+		}
+		frames = append(frames, frame)
+		size = next
+		return true
+	}
+
+	p.pendingMu.Lock()
+	pending := p.pending
+	p.pending = nil
+	p.pendingMu.Unlock()
+	if pending != nil {
+		add(pending)
+	}
+
 	for len(frames) < limit {
 		select {
 		case frame := <-p.outbound:
-			frames = append(frames, frame)
+			if !add(frame) {
+				p.pendingMu.Lock()
+				p.pending = frame
+				p.pendingMu.Unlock()
+				return frames
+			}
 		default:
 			return frames
 		}
@@ -734,6 +850,10 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		return
 	}
 	if len(kcpPayload) >= 6 && binary.BigEndian.Uint32(kcpPayload[0:4]) == batchMagic {
+		if binary.BigEndian.Uint16(kcpPayload[4:6]) == 0 {
+			p.markIdleIngress()
+			return
+		}
 		p.handleIncomingBatch(kcpPayload)
 		return
 	}
@@ -788,6 +908,16 @@ func (p *streamTransport) handleIncomingBatch(payload []byte) {
 		p.deliverKCPPacket(payload[off : off+n])
 		off += n
 	}
+}
+
+// markIdleIngress records a keepalive from the selected peer. smux keepalives
+// are disabled, so an idle but healthy session carries no KCP packets at all;
+// without counting keepalives the server watchdog reads an idle session as
+// frozen ingress and restarts olcrtc, which strands the connected client.
+func (p *streamTransport) markIdleIngress() {
+	p.lastIngressAt.Store(time.Now().UnixNano())
+	p.inFrames.Add(1)
+	p.maybeLogStats()
 }
 
 func (p *streamTransport) deliverKCPPacket(packet []byte) {

@@ -31,10 +31,12 @@ const (
 	// limits with enough headroom for VP8/RTP framing.
 	kcpMTU = 1000
 
-	// Receive/send window in segments. Large window allows in-flight bursts
-	// without stalling - important when one VP8 frame may carry many KCP
-	// segments and ACKs trickle back at frame cadence.
-	kcpSndWnd = 4096
+	// Send/receive window in segments. Telemost forwards a few hundred
+	// one-segment samples per second. With no KCP congestion
+	// control a 4096-segment send window fills a multi-second queue, retransmit
+	// timers fire for segments still waiting locally and duplicates crowd out
+	// fresh data. 128 segments bound the local queue to ~0.2s at 600 samples/s.
+	kcpSndWnd = 128
 	kcpRcvWnd = 4096
 
 	// Length prefix for our message framing on top of KCP stream mode.

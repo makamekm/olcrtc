@@ -454,3 +454,134 @@ func testVP8Frame(t *testing.T, token uint32, epoch uint32, payload []byte) []by
 	copy(frame[epochHdrLen:], payload)
 	return frame
 }
+
+func testKCPFrame(t *testing.T, payloadLen int, fill byte) []byte {
+	t.Helper()
+	return append(make([]byte, epochHdrLen), bytes.Repeat([]byte{fill}, payloadLen)...)
+}
+
+func batchSampleSize(frames [][]byte) int {
+	if len(frames) == 1 {
+		return len(frames[0])
+	}
+	size := epochHdrLen + 6
+	for _, frame := range frames {
+		size += 2 + len(frame) - epochHdrLen
+	}
+	return size
+}
+
+func TestCollectOutboundBatchKeepsSampleInOneRTPPacket(t *testing.T) {
+	tr := &streamTransport{
+		batchSize:      32,
+		maxSampleBytes: defaultMaxSampleBytes,
+		outbound:       make(chan []byte, 32),
+	}
+	for i := range 5 {
+		tr.outbound <- testKCPFrame(t, 400, byte(i))
+	}
+
+	var sent [][]byte
+	for range 5 {
+		batch := tr.collectOutboundBatch()
+		if len(batch) == 0 {
+			break
+		}
+		if size := batchSampleSize(batch); size > defaultMaxSampleBytes {
+			t.Fatalf("sample size = %d, want <= %d", size, defaultMaxSampleBytes)
+		}
+		sent = append(sent, batch...)
+	}
+	if len(sent) != 5 {
+		t.Fatalf("sent %d frames, want 5 (deferred frame lost?)", len(sent))
+	}
+	for i, frame := range sent {
+		if frame[epochHdrLen] != byte(i) {
+			t.Fatalf("frame %d out of order: fill=%d", i, frame[epochHdrLen])
+		}
+	}
+}
+
+func TestCollectOutboundBatchSendsOversizedFrameAlone(t *testing.T) {
+	tr := &streamTransport{
+		batchSize:      32,
+		maxSampleBytes: 200,
+		outbound:       make(chan []byte, 4),
+	}
+	tr.outbound <- testKCPFrame(t, 500, 1)
+	tr.outbound <- testKCPFrame(t, 10, 2)
+
+	if batch := tr.collectOutboundBatch(); len(batch) != 1 || batch[0][epochHdrLen] != 1 {
+		t.Fatalf("first batch = %d frames, want the oversized frame alone", len(batch))
+	}
+	if batch := tr.collectOutboundBatch(); len(batch) != 1 || batch[0][epochHdrLen] != 2 {
+		t.Fatalf("second batch = %d frames, want the deferred small frame", len(batch))
+	}
+}
+
+func TestDrainOutboundDropsDeferredFrame(t *testing.T) {
+	tr := &streamTransport{
+		batchSize:      32,
+		maxSampleBytes: 100,
+		outbound:       make(chan []byte, 4),
+	}
+	tr.outbound <- testKCPFrame(t, 60, 1)
+	tr.outbound <- testKCPFrame(t, 60, 2)
+	if batch := tr.collectOutboundBatch(); len(batch) != 1 {
+		t.Fatalf("batch = %d frames, want 1", len(batch))
+	}
+
+	tr.drainOutbound()
+
+	if batch := tr.collectOutboundBatch(); len(batch) != 0 {
+		t.Fatalf("frame from a reset KCP session survived drain: %d frames", len(batch))
+	}
+}
+
+func TestIdleKeepaliveFromPeerCountsAsIngress(t *testing.T) {
+	out, peer := directionalBindingTokens("srv-u-device-1")
+	tr := &streamTransport{
+		bindingToken:     out,
+		peerBindingToken: peer,
+		localEpoch:       111,
+		outbound:         make(chan []byte, 8),
+		onData:           func([]byte) {},
+	}
+	defer func() {
+		tr.kcpMu.RLock()
+		rt := tr.kcp
+		tr.kcpMu.RUnlock()
+		if rt != nil {
+			rt.close()
+		}
+	}()
+
+	idle := make([]byte, 10)
+	binary.BigEndian.PutUint32(idle[0:4], batchMagic)
+	binary.BigEndian.PutUint32(idle[6:10], 7)
+
+	tr.handleIncomingFrame(testVP8Frame(t, peer, 222, idle))
+	tr.handleIncomingFrame(testVP8Frame(t, peer, 222, idle))
+
+	if got := tr.inFrames.Load(); got != 2 {
+		t.Fatalf("inFrames = %d, want 2: idle keepalives must keep the watchdog from restarting an idle session", got)
+	}
+	if got := tr.inBytes.Load(); got != 0 {
+		t.Fatalf("inBytes = %d, want 0 for keepalives", got)
+	}
+	if tr.lastIngressAt.Load() == 0 {
+		t.Fatal("lastIngressAt not updated by keepalive")
+	}
+}
+
+func TestSampleIntervalUsesPacingFloorForLegacyTokenFPS(t *testing.T) {
+	floor := time.Second / minSamplesPerSecond
+	for _, fps := range []int{25, 60} {
+		if got := sampleInterval(fps); got != floor {
+			t.Fatalf("sampleInterval(%d) = %v, want %v", fps, got, floor)
+		}
+	}
+	if got := sampleInterval(2000); got != time.Second/2000 {
+		t.Fatalf("sampleInterval(2000) = %v, want %v", got, time.Second/2000)
+	}
+}
