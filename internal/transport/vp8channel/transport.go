@@ -58,7 +58,16 @@ const (
 	maxDynamicBatchSize   = 64
 	canSendHighWatermark  = 90 // percent
 	keepaliveIdlePeriod   = 100 * time.Millisecond
-	peerIngressIdlePeriod = 3 * time.Second
+	// After deepIdleAfter without payload the keepalive slows to
+	// keepaliveDeepIdlePeriod (override OLCRTC_VP8_IDLE_KEEPALIVE_MS): ten
+	// frames a second in both directions kept phone radios (LTE in
+	// particular) from ever dropping to their low-power state.
+	keepaliveDeepIdlePeriod = time.Second
+	deepIdleAfter           = 5 * time.Second
+	// minFramesBetweenKeyframes keeps a slow idle stream from turning into
+	// keyframe-only video, which is what made Telemost throttle rooms.
+	minFramesBetweenKeyframes = 4
+	peerIngressIdlePeriod     = 3 * time.Second
 
 	// defaultMaxSampleBytes caps one VP8 sample so it fits into a single RTP
 	// packet (pion packetizes at a 1200-byte MTU). Telemost drops video above
@@ -120,33 +129,34 @@ const (
 )
 
 type streamTransport struct {
-	stream           carrier.VideoTrack
-	track            *webrtc.TrackLocalStaticSample
-	onData           func([]byte)
-	outbound         chan []byte
-	closeCh          chan struct{}
-	writerDone       chan struct{}
-	closed           atomic.Bool
-	writerUp         atomic.Bool
-	writerOnce       sync.Once
-	kcpOnce          sync.Once
-	frameInterval    time.Duration
-	batchSize        int
-	maxSampleBytes   int
-	keyframeInterval time.Duration
-	lastKeyframeAt   time.Time
-	pendingMu        sync.Mutex
-	pending          []byte
-	outFrames        atomic.Uint64
-	outBytes         atomic.Uint64
-	inFrames         atomic.Uint64
-	inBytes          atomic.Uint64
-	idleNonce        atomic.Uint64
-	lastStats        atomic.Int64
-	lastEpochReset   atomic.Int64
-	lastIngressAt    atomic.Int64
-	localReconnectAt atomic.Int64
-	firstPeerAt      atomic.Int64
+	stream              carrier.VideoTrack
+	track               *webrtc.TrackLocalStaticSample
+	onData              func([]byte)
+	outbound            chan []byte
+	closeCh             chan struct{}
+	writerDone          chan struct{}
+	closed              atomic.Bool
+	writerUp            atomic.Bool
+	writerOnce          sync.Once
+	kcpOnce             sync.Once
+	frameInterval       time.Duration
+	batchSize           int
+	maxSampleBytes      int
+	keyframeInterval    time.Duration
+	lastKeyframeAt      time.Time
+	framesSinceKeyframe int
+	pendingMu           sync.Mutex
+	pending             []byte
+	outFrames           atomic.Uint64
+	outBytes            atomic.Uint64
+	inFrames            atomic.Uint64
+	inBytes             atomic.Uint64
+	idleNonce           atomic.Uint64
+	lastStats           atomic.Int64
+	lastEpochReset      atomic.Int64
+	lastIngressAt       atomic.Int64
+	localReconnectAt    atomic.Int64
+	firstPeerAt         atomic.Int64
 
 	// localEpoch is bumped on every KCP session restart and stamped into
 	// every outgoing VP8 frame. peerEpoch tracks the last epoch we observed
@@ -368,11 +378,15 @@ func (p *streamTransport) markFrameType(sample []byte, now time.Time) {
 	if p.keyframeInterval <= 0 || len(sample) == 0 {
 		return
 	}
-	if p.lastKeyframeAt.IsZero() || now.Sub(p.lastKeyframeAt) >= p.keyframeInterval {
+	elapsed := now.Sub(p.lastKeyframeAt)
+	due := elapsed >= p.keyframeInterval && p.framesSinceKeyframe >= minFramesBetweenKeyframes
+	if p.lastKeyframeAt.IsZero() || due || elapsed >= 5*p.keyframeInterval {
 		p.lastKeyframeAt = now
+		p.framesSinceKeyframe = 0
 		sample[0] &^= 0x01
 		return
 	}
+	p.framesSinceKeyframe++
 	sample[0] |= 0x01
 }
 
@@ -499,9 +513,12 @@ func (p *streamTransport) writerLoop() {
 	keepalive := time.NewTimer(keepaliveIdlePeriod)
 	defer keepalive.Stop()
 	var lastWrite time.Time
+	lastPayloadAt := time.Now()
+	deepIdlePeriod := time.Duration(envInt("OLCRTC_VP8_IDLE_KEEPALIVE_MS", int(keepaliveDeepIdlePeriod/time.Millisecond))) * time.Millisecond
 
 	for {
 		var frames [][]byte
+		idle := false
 		if p.hasQueuedOutbound() {
 			frames = p.pacedOutboundBatch(lastWrite)
 		} else {
@@ -513,6 +530,7 @@ func (p *streamTransport) writerLoop() {
 				frames = p.pacedOutboundBatch(lastWrite)
 			case <-keepalive.C:
 				frames = [][]byte{p.buildIdleFrame()}
+				idle = true
 			}
 		}
 		if p.closed.Load() {
@@ -524,7 +542,14 @@ func (p *streamTransport) writerLoop() {
 		}
 
 		lastWrite = p.writeFrames(frames, lastWrite)
-		keepalive.Reset(keepaliveIdlePeriod)
+		if !idle {
+			lastPayloadAt = lastWrite
+		}
+		if lastWrite.Sub(lastPayloadAt) >= deepIdleAfter {
+			keepalive.Reset(deepIdlePeriod)
+		} else {
+			keepalive.Reset(keepaliveIdlePeriod)
+		}
 	}
 }
 

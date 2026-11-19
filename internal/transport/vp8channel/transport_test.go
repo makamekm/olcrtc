@@ -600,8 +600,15 @@ func TestMarkFrameTypeSendsOneKeyframePerInterval(t *testing.T) {
 	if got := frame(start.Add(500 * time.Millisecond)); got != 1 {
 		t.Fatalf("sample inside interval must be an interframe, frame-type bit=%d", got)
 	}
+	for i := 1; i <= minFramesBetweenKeyframes; i++ {
+		frame(start.Add(time.Duration(i) * 100 * time.Millisecond))
+	}
 	if got := frame(start.Add(time.Second)); got != 0 {
 		t.Fatalf("sample after interval must be a keyframe, frame-type bit=%d", got)
+	}
+	// A slow idle stream (one frame per second) must not become keyframe-only.
+	if got := frame(start.Add(2 * time.Second)); got != 1 {
+		t.Fatalf("slow idle frame right after a keyframe must be an interframe, frame-type bit=%d", got)
 	}
 }
 

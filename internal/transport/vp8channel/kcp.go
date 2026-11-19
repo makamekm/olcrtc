@@ -39,7 +39,11 @@ const (
 	// samples/s while covering the bandwidth-delay product of high-RTT (LTE)
 	// paths; 128 capped throughput there. Override: OLCRTC_KCP_SNDWND.
 	kcpSndWnd = 384
-	kcpRcvWnd = 4096
+
+	// kcpIntervalMs is KCP's internal update tick; each tick wakes the CPU,
+	// even with no traffic. Override: OLCRTC_KCP_INTERVAL_MS.
+	kcpIntervalMs = 15
+	kcpRcvWnd     = 4096
 
 	// Length prefix for our message framing on top of KCP stream mode.
 	// We use stream mode because UDPSession.Write fragments messages > MSS
@@ -84,7 +88,7 @@ func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte
 	// before the first byte of the response shows up). Below 5ms the
 	// CPU cost of the KCP update loop starts climbing without much
 	// additional latency benefit.
-	sess.SetNoDelay(1, 5, 2, 1)
+	sess.SetNoDelay(1, envInt("OLCRTC_KCP_INTERVAL_MS", kcpIntervalMs), 2, 1)
 	sess.SetWindowSize(envInt("OLCRTC_KCP_SNDWND", kcpSndWnd), kcpRcvWnd)
 	sess.SetMtu(kcpMTU)
 	sess.SetACKNoDelay(true)
