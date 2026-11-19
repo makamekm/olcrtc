@@ -35,8 +35,10 @@ const (
 	// one-segment samples per second. With no KCP congestion
 	// control a 4096-segment send window fills a multi-second queue, retransmit
 	// timers fire for segments still waiting locally and duplicates crowd out
-	// fresh data. 128 segments bound the local queue to ~0.2s at 600 samples/s.
-	kcpSndWnd = 128
+	// fresh data. 384 segments bound the local queue to ~0.25s at 1600
+	// samples/s while covering the bandwidth-delay product of high-RTT (LTE)
+	// paths; 128 capped throughput there. Override: OLCRTC_KCP_SNDWND.
+	kcpSndWnd = 384
 	kcpRcvWnd = 4096
 
 	// Length prefix for our message framing on top of KCP stream mode.
@@ -83,7 +85,7 @@ func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte
 	// CPU cost of the KCP update loop starts climbing without much
 	// additional latency benefit.
 	sess.SetNoDelay(1, 5, 2, 1)
-	sess.SetWindowSize(kcpSndWnd, kcpRcvWnd)
+	sess.SetWindowSize(envInt("OLCRTC_KCP_SNDWND", kcpSndWnd), kcpRcvWnd)
 	sess.SetMtu(kcpMTU)
 	sess.SetACKNoDelay(true)
 	sess.SetWriteDelay(false)

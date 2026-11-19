@@ -65,9 +65,12 @@ const (
 	// roughly 1 Mbit/s per subscriber; a multi-packet sample loses every byte
 	// when any one of its packets is dropped, so large batches collapse KCP.
 	defaultMaxSampleBytes = 1100
-	// minSamplesPerSecond is the pacing floor for one-packet samples. Measured
-	// against Telemost: ~40 KB/s at 60/s, ~300 KB/s at 600-700/s, flat above.
-	minSamplesPerSecond = 600
+	// minSamplesPerSecond is the pacing floor for one-packet samples
+	// (override: OLCRTC_VP8_MIN_SPS). With keyframe-only video Telemost
+	// throttled anything above ~600/s; with one keyframe per second the
+	// measured download/upload is ~230/160 KB/s at 600/s, ~470/260 at 1200/s,
+	// ~500/450 at 1600/s and only marginally more above that.
+	minSamplesPerSecond = 1600
 	maxSampleBytesEnv   = "OLCRTC_VP8_MAX_SAMPLE_BYTES"
 	keyframeIntervalEnv = "OLCRTC_VP8_KEYFRAME_INTERVAL_MS"
 	// Telemost throttles a room to ~3 forwarded frames/s once it has carried a
@@ -320,7 +323,7 @@ func randomEpoch() uint32 {
 // second, while the 25-60 fps values baked into existing connection tokens
 // would cap the tunnel at ~60 KB/s. Those values are treated as a floor.
 func sampleInterval(fps int) time.Duration {
-	return time.Second / time.Duration(max(fps, minSamplesPerSecond))
+	return time.Second / time.Duration(max(fps, envInt("OLCRTC_VP8_MIN_SPS", minSamplesPerSecond)))
 }
 
 func maxSampleBytesFromEnv() int {
@@ -337,6 +340,15 @@ func maxSampleBytesFromEnv() int {
 
 // keyframeIntervalFromEnv returns how often a sample is marked as a VP8
 // keyframe; 0 (OLCRTC_VP8_KEYFRAME_INTERVAL_MS=0) marks every sample.
+// envInt reads a positive integer tuning override, falling back to def.
+func envInt(name string, def int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil || value <= 0 {
+		return def
+	}
+	return value
+}
+
 func keyframeIntervalFromEnv() time.Duration {
 	raw := strings.TrimSpace(os.Getenv(keyframeIntervalEnv))
 	if raw == "" {
