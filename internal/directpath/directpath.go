@@ -209,7 +209,9 @@ type Offerer struct {
 
 // NewOfferer creates the client peer connection and its local offer.
 func NewOfferer(ctx context.Context) (*Offerer, string, error) {
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: clientSTUN})
+	engine := webrtc.SettingEngine{}
+	tuneSCTP(&engine)
+	pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(engine)).NewPeerConnection(webrtc.Configuration{ICEServers: clientSTUN})
 	if err != nil {
 		return nil, "", fmt.Errorf("new peer connection: %w", err)
 	}
@@ -310,6 +312,7 @@ func ServerFromEnv(ctx context.Context) (*Server, error) {
 		}
 	}
 	engine := webrtc.SettingEngine{}
+	tuneSCTP(&engine)
 	engine.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udp))
 	engine.SetICETCPMux(webrtc.NewICETCPMux(nil, tcp, 64))
 	engine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4, webrtc.NetworkTypeTCP4})
@@ -407,6 +410,33 @@ func withCandidates(sdp string, lines []string) string {
 	}
 	flush()
 	return strings.Join(out, nl) + nl
+}
+
+// tuneSCTP sets the data channel's SCTP knobs (env overrides for tuning).
+func tuneSCTP(e *webrtc.SettingEngine) {
+	if v := envUint("OLCRTC_SCTP_RCVBUF", 0); v > 0 {
+		e.SetSCTPMaxReceiveBufferSize(v)
+	}
+	if v := envUint("OLCRTC_SCTP_MIN_CWND", 0); v > 0 {
+		e.SetSCTPMinCwnd(v)
+	}
+	if v := envUint("OLCRTC_SCTP_CA_STEP", 0); v > 0 {
+		e.SetSCTPCwndCAStep(v)
+	}
+	if v := envUint("OLCRTC_SCTP_FAST_RTX_WND", 0); v > 0 {
+		e.SetSCTPFastRtxWnd(v)
+	}
+	if v := envUint("OLCRTC_SCTP_RTO_MAX_MS", 0); v > 0 {
+		e.SetSCTPRTOMax(time.Duration(v) * time.Millisecond)
+	}
+}
+
+func envUint(name string, def uint32) uint32 {
+	v, err := strconv.ParseUint(strings.TrimSpace(os.Getenv(name)), 10, 32)
+	if err != nil {
+		return def
+	}
+	return uint32(v)
 }
 
 func nonEmpty(v, fallback string) string {
