@@ -5,6 +5,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"time"
 
@@ -14,7 +15,21 @@ import (
 
 const udpRelayIdleTimeout = 30 * time.Second
 
+// dnsRedirectEnabled sends every client DNS query (UDP port 53) to the
+// server's own resolver (-dns) instead of the one the client asked for.
+// Clusters set OLCRTC_DNS_REDIRECT=1: the resolver in a key may be filtered
+// or spoofed where a node runs (1.1.1.1 from Russia), while the node knows a
+// resolver that works there.
+func dnsRedirectEnabled() bool { return os.Getenv("OLCRTC_DNS_REDIRECT") == "1" }
+
 func (s *Server) dispatchUDP(stream *smux.Stream, req ConnectRequest) {
+	if req.Port == 53 && s.dnsServer != "" && dnsRedirectEnabled() {
+		if host, port, err := net.SplitHostPort(s.dnsServer); err == nil {
+			if p, err := strconv.Atoi(port); err == nil {
+				req.Addr, req.Port = host, p
+			}
+		}
+	}
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
 	logger.Debugf("sid=%d udp %s", stream.ID(), addr)
 
