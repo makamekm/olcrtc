@@ -78,6 +78,13 @@ func (d *directLink) WatchConnection(ctx context.Context) {
 }
 func (d *directLink) CanSend() bool { return d.transport.CanSend() }
 
+// SetBusyCallback forwards to transports that detect another device on the key.
+func (d *directLink) SetBusyCallback(cb func()) {
+	if b, ok := d.transport.(transport.BusyNotifier); ok {
+		b.SetBusyCallback(cb)
+	}
+}
+
 // AttachDirectPath hands a direct data channel to the transport when it can
 // use one; false means the transport has no direct-path support.
 func (d *directLink) AttachDirectPath(p *directpath.Path) bool {

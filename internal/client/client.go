@@ -2,6 +2,8 @@
 package client
 
 import (
+	"sync/atomic"
+
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -10,6 +12,7 @@ import (
 	"fmt"
 	"github.com/openlibrecommunity/olcrtc/internal/directpath"
 	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
+	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"io"
 	"net"
 	"sync"
@@ -57,6 +60,7 @@ type Client struct {
 	dnsServer       string
 	socksUser       string
 	socksPass       string
+	keyInUse        atomic.Bool // the server serves another device with this key
 }
 
 // Run starts the client with the specified parameters.
@@ -169,6 +173,9 @@ func RunWithReady(
 	go c.directPathLoop(runCtx)
 
 	<-runCtx.Done()
+	if c.keyInUse.Load() {
+		return transport.ErrKeyInUse
+	}
 	return nil
 }
 
@@ -323,6 +330,13 @@ func (c *Client) bringUpLink(
 		cancel()
 	})
 	ln.SetReconnectCallback(func() { c.handleReconnect() })
+	if b, ok := ln.(transport.BusyNotifier); ok {
+		b.SetBusyCallback(func() {
+			logger.Infof("Client: the access key is in use on another device")
+			c.keyInUse.Store(true)
+			cancel()
+		})
+	}
 
 	if err := ln.Connect(ctx); err != nil {
 		return fmt.Errorf("failed to connect link: %w", err)

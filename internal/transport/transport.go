@@ -9,6 +9,9 @@ import (
 var (
 	// ErrTransportNotFound is returned when a requested transport is not registered.
 	ErrTransportNotFound = errors.New("transport not found")
+	// ErrKeyInUse means the server keeps serving another device that uses the
+	// same access key; the text carries a stable KEY_IN_USE marker for apps.
+	ErrKeyInUse = errors.New("KEY_IN_USE: the access key is already in use on another device")
 )
 
 // Features describes the delivery semantics of a transport.
@@ -86,4 +89,10 @@ func Available() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// BusyNotifier is implemented by transports (and links wrapping them) that can
+// tell when the server serves another device with the same key.
+type BusyNotifier interface {
+	SetBusyCallback(cb func())
 }

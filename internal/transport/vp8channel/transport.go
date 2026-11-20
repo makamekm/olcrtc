@@ -174,6 +174,15 @@ type streamTransport struct {
 	// ownEpochs remembers every epoch this process has published so SFU
 	// reflections of an earlier local session still count as self-echo.
 	ownEpochs           sync.Map
+	// One device per key: servedSelfAt is the last server frame stamped
+	// with our current epoch, foreignSince the first frame since then that
+	// was stamped for a session that is not ours. If the server keeps
+	// serving someone else for keyInUseAfter, busyFn reports it once.
+	servedSelfAt atomic.Int64
+	foreignSince atomic.Int64
+	busyFired    atomic.Bool
+	busyMu       sync.Mutex
+	busyFn       func()
 	peerEpoch           atomic.Uint32
 	peerWireToken       atomic.Uint32
 	directionalPeerSeen atomic.Bool
@@ -403,14 +412,58 @@ func (p *streamTransport) stampServedEpoch(sample []byte) {
 	binary.BigEndian.PutUint16(sample[servedMarkOff:servedMarkOff+2], servedMarker)
 }
 
+// keyInUseAfter is how long the server may keep serving another device's
+// session before this client gives up. A restart of the same device is
+// taken over after the old session idles for 3 s, well inside this window.
+const keyInUseAfter = 12 * time.Second
+
 // servedOtherSession reports whether a frame from a server that stamps its
-// served session was meant for another (earlier) session of this client.
+// served session was meant for another session: an earlier one of this
+// client, or another device using the same key (tracked for busyFn).
 func (p *streamTransport) servedOtherSession(frame []byte) bool {
 	if p.serverRole || len(frame) < epochHdrLen ||
 		binary.BigEndian.Uint16(frame[servedMarkOff:servedMarkOff+2]) != servedMarker {
 		return false
 	}
-	return binary.BigEndian.Uint32(frame[servedEpochOff:servedMarkOff]) != p.localEpoch.Load()
+	served := binary.BigEndian.Uint32(frame[servedEpochOff:servedMarkOff])
+	now := time.Now().UnixNano()
+	if served == p.localEpoch.Load() {
+		p.servedSelfAt.Store(now)
+		p.foreignSince.Store(0)
+		return false
+	}
+	if served != 0 && !p.isOwnEpoch(served) {
+		p.noteForeignServed(now)
+	}
+	return true
+}
+
+func (p *streamTransport) noteForeignServed(now int64) {
+	since := p.foreignSince.Load()
+	if since == 0 {
+		p.foreignSince.CompareAndSwap(0, now)
+		return
+	}
+	if time.Duration(now-since) < keyInUseAfter || p.servedSelfAt.Load() > since {
+		return
+	}
+	if !p.busyFired.CompareAndSwap(false, true) {
+		return
+	}
+	logger.Infof("vp8channel: server has served another device with this key for %s - giving up", keyInUseAfter)
+	p.busyMu.Lock()
+	fn := p.busyFn
+	p.busyMu.Unlock()
+	if fn != nil {
+		go fn()
+	}
+}
+
+// SetBusyCallback registers the one device per key callback.
+func (p *streamTransport) SetBusyCallback(cb func()) {
+	p.busyMu.Lock()
+	p.busyFn = cb
+	p.busyMu.Unlock()
 }
 
 func (p *streamTransport) Send(data []byte) error {
