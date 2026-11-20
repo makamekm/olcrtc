@@ -27,7 +27,7 @@ const (
 	msgPing  byte = 1
 
 	pingInterval     = time.Second
-	unhealthyAfter   = 4 * time.Second
+	unhealthyAfter   = 3 * time.Second
 	gatherTimeout    = 4 * time.Second
 	connectTimeout   = 12 * time.Second
 	maxBufferedBytes = 4 << 20

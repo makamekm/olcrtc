@@ -206,12 +206,22 @@ func (c *Client) directPathLoop(ctx context.Context) {
 			return
 		}
 		logger.Infof("direct path: connected")
-		wait = 5 * time.Second
+		connectedAt := time.Now()
 		select {
 		case <-ctx.Done():
 			path.Close()
 			return
 		case <-path.Done():
+		}
+		// A path that dies right after connecting (a network that lets the
+		// first packets through and then drops them) must not flap: every
+		// loss stalls traffic for a few seconds before the conference path
+		// takes over. Back off unless the path held for a while.
+		if lived := time.Since(connectedAt); lived < time.Minute {
+			wait = min(max(wait*2, 30*time.Second), 10*time.Minute)
+			logger.Infof("direct path: lost after %v; retrying in %v", lived.Round(time.Second), wait)
+		} else {
+			wait = 5 * time.Second
 			logger.Infof("direct path: lost; renegotiating")
 		}
 	}
