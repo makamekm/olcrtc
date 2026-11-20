@@ -173,16 +173,16 @@ type streamTransport struct {
 	direct atomic.Pointer[directpath.Path]
 	// ownEpochs remembers every epoch this process has published so SFU
 	// reflections of an earlier local session still count as self-echo.
-	ownEpochs           sync.Map
+	ownEpochs sync.Map
 	// One device per key: servedSelfAt is the last server frame stamped
 	// with our current epoch, foreignSince the first frame since then that
 	// was stamped for a session that is not ours. If the server keeps
 	// serving someone else for keyInUseAfter, busyFn reports it once.
-	servedSelfAt atomic.Int64
-	foreignSince atomic.Int64
-	busyFired    atomic.Bool
-	busyMu       sync.Mutex
-	busyFn       func()
+	servedSelfAt        atomic.Int64
+	foreignSince        atomic.Int64
+	busyFired           atomic.Bool
+	busyMu              sync.Mutex
+	busyFn              func()
 	peerEpoch           atomic.Uint32
 	peerWireToken       atomic.Uint32
 	directionalPeerSeen atomic.Bool
