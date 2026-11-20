@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/openlibrecommunity/olcrtc/internal/directpath"
+	kcp "github.com/xtaci/kcp-go/v5"
 	"hash/fnv"
 	"os"
 	"strconv"
@@ -150,6 +151,8 @@ type streamTransport struct {
 	pending             []byte
 	outFrames           atomic.Uint64
 	outBytes            atomic.Uint64
+	directOutBytes      atomic.Uint64 // bytes sent over the direct path (drives directCC)
+	ccWnd               ccWindow      // directCC send window, 0 when inactive
 	inFrames            atomic.Uint64
 	inBytes             atomic.Uint64
 	idleNonce           atomic.Uint64
@@ -693,14 +696,26 @@ func (p *streamTransport) maybeLogStats() {
 	if now-prev < 10 || !p.lastStats.CompareAndSwap(prev, now) {
 		return
 	}
-	var directSent, directRecv uint64
+	var directSent, directRecv, directQueued uint64
+	var sctpCwnd, sctpRwnd uint32
+	var sctpSRTT float64
 	directUp := false
 	if path := p.direct.Load(); path != nil {
 		directSent, directRecv = path.Stats()
 		directUp = path.Healthy()
+		directQueued = path.Queued()
+		sctpCwnd, sctpRwnd, sctpSRTT = path.SCTPInfo()
 	}
+	var srtt int32
+	p.kcpMu.RLock()
+	if rt := p.kcp; rt != nil {
+		srtt = rt.sess.GetSRTT()
+	}
+	p.kcpMu.RUnlock()
+	// KCP counters are process-wide; one tunnel per process in practice.
+	snmp := kcp.DefaultSnmp.Copy()
 	logger.Infof(
-		"vp8channel stats: out_frames=%d out_bytes=%d in_frames=%d in_bytes=%d outbound_queue=%d/%d direct=%v direct_out=%d direct_in=%d",
+		"vp8channel stats: out_frames=%d out_bytes=%d in_frames=%d in_bytes=%d outbound_queue=%d/%d direct=%v direct_out=%d direct_in=%d kcp_out=%d kcp_retrans=%d kcp_fast=%d kcp_lost=%d kcp_dup=%d kcp_srtt=%dms direct_queued=%d sctp_cwnd=%d sctp_rwnd=%d sctp_srtt=%.0fms cc_wnd=%d",
 		p.outFrames.Load(),
 		p.outBytes.Load(),
 		p.inFrames.Load(),
@@ -708,6 +723,8 @@ func (p *streamTransport) maybeLogStats() {
 		len(p.outbound),
 		cap(p.outbound),
 		directUp, directSent, directRecv,
+		snmp.OutSegs, snmp.RetransSegs, snmp.FastRetransSegs, snmp.LostSegs, snmp.RepeatSegs,
+		srtt, directQueued, sctpCwnd, sctpRwnd, sctpSRTT, p.ccWnd.Load(),
 	)
 }
 
@@ -838,6 +855,7 @@ func (p *streamTransport) AttachDirectPath(path *directpath.Path) {
 		old.Close()
 	}
 	logger.Infof("vp8channel: direct path attached")
+	go p.runDirectCC(path)
 	go func() {
 		<-path.Done()
 		if p.direct.CompareAndSwap(path, nil) {
@@ -862,6 +880,7 @@ func (p *streamTransport) trySendDirect(frame []byte) bool {
 	}
 	p.outFrames.Add(1)
 	p.outBytes.Add(uint64(len(frame)))
+	p.directOutBytes.Add(uint64(len(frame)))
 	return true
 }
 

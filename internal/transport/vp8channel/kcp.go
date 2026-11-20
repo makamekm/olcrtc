@@ -88,7 +88,7 @@ func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte
 	// before the first byte of the response shows up). Below 5ms the
 	// CPU cost of the KCP update loop starts climbing without much
 	// additional latency benefit.
-	sess.SetNoDelay(1, envInt("OLCRTC_KCP_INTERVAL_MS", kcpIntervalMs), 2, 1)
+	sess.SetNoDelay(envInt("OLCRTC_KCP_NODELAY", 1), envInt("OLCRTC_KCP_INTERVAL_MS", kcpIntervalMs), 2, 1)
 	sess.SetWindowSize(envInt("OLCRTC_KCP_SNDWND", kcpSndWnd), kcpRcvWnd)
 	sess.SetMtu(kcpMTU)
 	sess.SetACKNoDelay(true)

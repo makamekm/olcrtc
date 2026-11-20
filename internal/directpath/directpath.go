@@ -134,6 +134,28 @@ func (p *Path) Send(frame []byte) bool {
 	return true
 }
 
+// Queued is how many bytes wait in the data channel's send buffer.
+func (p *Path) Queued() uint64 {
+	if p == nil || p.dc == nil {
+		return 0
+	}
+	return p.dc.BufferedAmount()
+}
+
+// SCTPInfo reports the data channel's SCTP congestion window, peer receive
+// window and smoothed RTT (diagnostics).
+func (p *Path) SCTPInfo() (cwnd, rwnd uint32, srttMs float64) {
+	if p == nil || p.pc == nil {
+		return 0, 0, 0
+	}
+	for _, st := range p.pc.GetStats() {
+		if s, ok := st.(webrtc.SCTPTransportStats); ok {
+			return s.CongestionWindow, s.ReceiverWindow, s.SmoothedRoundTripTime * 1000
+		}
+	}
+	return 0, 0, 0
+}
+
 // Done is closed when the path is gone for good.
 func (p *Path) Done() <-chan struct{} { return p.done }
 
