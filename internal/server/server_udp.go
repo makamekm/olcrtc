@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
@@ -22,6 +23,20 @@ const udpRelayIdleTimeout = 30 * time.Second
 // resolver that works there.
 func dnsRedirectEnabled() bool { return os.Getenv("OLCRTC_DNS_REDIRECT") == "1" }
 
+// udpDeniedPort reports whether OLCRTC_UDP_DENY_PORTS (comma separated) lists
+// port. Clusters deny 443 when a user's traffic must leave elsewhere than the
+// server: UDP is relayed straight from the server, so QUIC would bypass that
+// routing (and from Russia QUIC to foreign services is throttled). A quick
+// refusal makes apps fall back to TCP at once instead of waiting on QUIC.
+func udpDeniedPort(port int) bool {
+	for _, f := range strings.Split(os.Getenv("OLCRTC_UDP_DENY_PORTS"), ",") {
+		if p, err := strconv.Atoi(strings.TrimSpace(f)); err == nil && p == port {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) dispatchUDP(stream *smux.Stream, req ConnectRequest) {
 	if req.Port == 53 && s.dnsServer != "" && dnsRedirectEnabled() {
 		if host, port, err := net.SplitHostPort(s.dnsServer); err == nil {
@@ -32,6 +47,12 @@ func (s *Server) dispatchUDP(stream *smux.Stream, req ConnectRequest) {
 	}
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
 	logger.Debugf("sid=%d udp %s", stream.ID(), addr)
+
+	if udpDeniedPort(req.Port) {
+		logger.Debugf("sid=%d udp %s refused by OLCRTC_UDP_DENY_PORTS", stream.ID(), addr)
+		_, _ = stream.Write([]byte{0x01})
+		return
+	}
 
 	if isBlockedEgressIPv4Address(req.Addr) && !lanaccess.Contains(req.Addr) {
 		logger.Infof("sid=%d udp %s rejected: non-public egress address", stream.ID(), addr)
