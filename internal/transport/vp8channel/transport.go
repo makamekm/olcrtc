@@ -31,6 +31,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/openlibrecommunity/olcrtc/internal/directpath"
 	"hash/fnv"
 	"os"
 	"strconv"
@@ -167,6 +168,9 @@ type streamTransport struct {
 	publishLegacy      bool
 	serverRole         bool
 	localEpoch         atomic.Uint32
+	// direct is the optional peer-to-peer data channel; KCP packets prefer it
+	// while it is healthy and fall back to the conference path otherwise.
+	direct atomic.Pointer[directpath.Path]
 	// ownEpochs remembers every epoch this process has published so SFU
 	// reflections of an earlier local session still count as self-echo.
 	ownEpochs           sync.Map
@@ -636,14 +640,21 @@ func (p *streamTransport) maybeLogStats() {
 	if now-prev < 10 || !p.lastStats.CompareAndSwap(prev, now) {
 		return
 	}
+	var directSent, directRecv uint64
+	directUp := false
+	if path := p.direct.Load(); path != nil {
+		directSent, directRecv = path.Stats()
+		directUp = path.Healthy()
+	}
 	logger.Infof(
-		"vp8channel stats: out_frames=%d out_bytes=%d in_frames=%d in_bytes=%d outbound_queue=%d/%d",
+		"vp8channel stats: out_frames=%d out_bytes=%d in_frames=%d in_bytes=%d outbound_queue=%d/%d direct=%v direct_out=%d direct_in=%d",
 		p.outFrames.Load(),
 		p.outBytes.Load(),
 		p.inFrames.Load(),
 		p.inBytes.Load(),
 		len(p.outbound),
 		cap(p.outbound),
+		directUp, directSent, directRecv,
 	)
 }
 
@@ -752,6 +763,55 @@ func (p *streamTransport) resetForNewPeerSession() {
 	}
 }
 
+func (p *streamTransport) newKCP() (*kcpRuntime, error) {
+	rt, err := startKCP(p.outbound, p.onData, p.epochHeader())
+	if err != nil {
+		return nil, err
+	}
+	rt.conn.setRoute(p.trySendDirect)
+	return rt, nil
+}
+
+// AttachDirectPath routes KCP packets over a direct data channel while it is
+// healthy. Frames arriving on it go through the same token/epoch checks as
+// conference frames, so a stale path cannot inject into a newer session.
+func (p *streamTransport) AttachDirectPath(path *directpath.Path) {
+	path.OnFrame(func(frame []byte) {
+		if len(frame) >= epochHdrLen {
+			p.handleIncomingFrame(frame)
+		}
+	})
+	if old := p.direct.Swap(path); old != nil && old != path {
+		old.Close()
+	}
+	logger.Infof("vp8channel: direct path attached")
+	go func() {
+		<-path.Done()
+		if p.direct.CompareAndSwap(path, nil) {
+			logger.Infof("vp8channel: direct path closed; using conference path")
+		}
+	}()
+}
+
+// DirectPathActive reports whether a healthy direct path is attached.
+func (p *streamTransport) DirectPathActive() bool { return p.direct.Load().Healthy() }
+
+func (p *streamTransport) trySendDirect(frame []byte) bool {
+	path := p.direct.Load()
+	if path == nil || !path.Healthy() {
+		return false
+	}
+	if p.serverRole {
+		p.stampServedEpoch(frame)
+	}
+	if !path.Send(frame) {
+		return false
+	}
+	p.outFrames.Add(1)
+	p.outBytes.Add(uint64(len(frame)))
+	return true
+}
+
 func (p *streamTransport) setLocalEpoch(epoch uint32) {
 	p.ownEpochs.Store(epoch, struct{}{})
 	p.localEpoch.Store(epoch)
@@ -796,7 +856,7 @@ func (p *streamTransport) resetKCP() {
 	// peer-triggered reset, the peer would see a "new" epoch from us, reset
 	// itself, send back its (unchanged) epoch which we'd then see as "new"
 	// again - and the two sides would loop forever tearing down smux.
-	rt, err := startKCP(p.outbound, p.onData, p.epochHeader())
+	rt, err := p.newKCP()
 	if err != nil {
 		return
 	}
@@ -910,7 +970,7 @@ func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
 	p.firstPeerAt.Store(time.Now().UnixNano())
 	logger.Infof("vp8channel: peer first seen epoch=0x%08x", peerEpoch)
 	p.kcpOnce.Do(func() {
-		rt, err := startKCP(p.outbound, p.onData, p.epochHeader())
+		rt, err := p.newKCP()
 		if err != nil {
 			logger.Infof("vp8channel: startKCP failed: %v", err)
 			return

@@ -7,6 +7,7 @@ package vp8channel
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,6 +33,9 @@ type kcpConn struct {
 	// can detect a session restart on our side (see transport.go for the
 	// layout). Stable for the lifetime of this kcpConn.
 	epochHdr [epochHdrLen]byte
+	// route, when set, may take a packet (e.g. over a direct path); packets
+	// it declines go to the conference outbound queue.
+	route atomic.Pointer[func([]byte) bool]
 
 	mu        sync.Mutex
 	rDeadline time.Time
@@ -52,6 +56,8 @@ func newKCPConn(out chan<- []byte, inboundCap int, epochHdr [epochHdrLen]byte) *
 
 // deliver hands an incoming wire payload to the KCP read loop. Drops on
 // overflow are intentional - KCP will detect the loss via SACK and retransmit.
+func (c *kcpConn) setRoute(fn func([]byte) bool) { c.route.Store(&fn) }
+
 func (c *kcpConn) deliver(payload []byte) {
 	cp := make([]byte, len(payload))
 	copy(cp, payload)
@@ -93,6 +99,10 @@ func (c *kcpConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	buf := make([]byte, epochHdrLen+len(p))
 	copy(buf, c.epochHdr[:])
 	copy(buf[epochHdrLen:], p)
+
+	if route := c.route.Load(); route != nil && (*route)(buf) {
+		return len(p), nil
+	}
 
 	c.mu.Lock()
 	deadline := c.wDeadline

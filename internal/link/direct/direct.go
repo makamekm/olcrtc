@@ -4,6 +4,7 @@ package direct
 import (
 	"context"
 	"fmt"
+	"github.com/openlibrecommunity/olcrtc/internal/directpath"
 
 	"github.com/openlibrecommunity/olcrtc/internal/link"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -76,3 +77,13 @@ func (d *directLink) WatchConnection(ctx context.Context) {
 	d.transport.WatchConnection(ctx)
 }
 func (d *directLink) CanSend() bool { return d.transport.CanSend() }
+
+// AttachDirectPath hands a direct data channel to the transport when it can
+// use one; false means the transport has no direct-path support.
+func (d *directLink) AttachDirectPath(p *directpath.Path) bool {
+	a, ok := d.transport.(directpath.Attacher)
+	if ok {
+		a.AttachDirectPath(p)
+	}
+	return ok
+}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/openlibrecommunity/olcrtc/internal/directpath"
 	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
 	"io"
 	"net"
@@ -56,6 +57,8 @@ type Server struct {
 	resolver        *net.Resolver
 	socksProxyAddr  string
 	socksProxyPort  int
+	// direct accepts peer-to-peer data channels (nil when disabled).
+	direct *directpath.Server
 	// sniRouting is on while the configured resolver answers with router
 	// bypass (synthetic 198.18.0.0/15) addresses; see probeSyntheticDNS.
 	sniRouting atomic.Bool
@@ -115,6 +118,11 @@ func Run(
 	}
 	s.setupResolver()
 	go s.probeSyntheticDNS(runCtx)
+	if direct, err := directpath.ServerFromEnv(runCtx); err != nil {
+		logger.Warnf("direct path disabled: %v", err)
+	} else {
+		s.direct = direct
+	}
 
 	if err := s.bringUpLink(
 		runCtx, linkName, transportName, carrierName, roomURL, cancel,
@@ -413,7 +421,7 @@ func parseConnectRequest(buf []byte) (ConnectRequest, bool) {
 	if err := json.Unmarshal(buf, &req); err != nil {
 		return req, false
 	}
-	if req.Cmd != connectCommand && req.Cmd != udpCommand {
+	if req.Cmd != connectCommand && req.Cmd != udpCommand && req.Cmd != directpath.Command {
 		return req, false
 	}
 	return req, true
@@ -430,6 +438,10 @@ func serverClientIdentity(clientID string) string {
 func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
 	if req.Cmd == udpCommand {
 		s.dispatchUDP(stream, req)
+		return
+	}
+	if req.Cmd == directpath.Command {
+		s.dispatchDirect(stream)
 		return
 	}
 
@@ -463,6 +475,44 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
 		_ = stream.CloseWrite()
 	}()
 	_, _ = io.Copy(conn, stream)
+}
+
+// dispatchDirect negotiates a peer-to-peer data channel with the client over
+// this stream and hands it to the link; the tunnel keeps working over the
+// conference path whenever the direct one is unavailable.
+func (s *Server) dispatchDirect(stream *smux.Stream) {
+	la, ok := s.ln.(directpath.LinkAttacher)
+	if s.direct == nil || !ok {
+		_, _ = stream.Write([]byte{directpath.AckUnsupported})
+		return
+	}
+	if _, err := stream.Write([]byte{directpath.AckSupported}); err != nil {
+		return
+	}
+	_ = stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	offer, err := directpath.ReadBlob(stream)
+	_ = stream.SetReadDeadline(time.Time{})
+	if err != nil {
+		logger.Infof("sid=%d direct offer: %v", stream.ID(), err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	path, answer, err := s.direct.Answer(ctx, string(offer))
+	if err != nil {
+		logger.Infof("sid=%d direct answer: %v", stream.ID(), err)
+		_ = directpath.WriteBlob(stream, nil)
+		return
+	}
+	if err := directpath.WriteBlob(stream, []byte(answer)); err != nil {
+		path.Close()
+		return
+	}
+	if !la.AttachDirectPath(path) {
+		path.Close()
+		return
+	}
+	logger.Infof("sid=%d direct path negotiated", stream.ID())
 }
 
 // shouldRouteBySNI reports whether an HTTPS connection to a bare public IP

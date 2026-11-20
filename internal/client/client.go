@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/openlibrecommunity/olcrtc/internal/directpath"
 	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
 	"io"
 	"net"
@@ -165,9 +166,99 @@ func RunWithReady(
 	}
 
 	go c.acceptLoop(runCtx, listener)
+	go c.directPathLoop(runCtx)
 
 	<-runCtx.Done()
 	return nil
+}
+
+// directPathLoop keeps trying to add a peer-to-peer data channel next to the
+// conference path. Traffic moves to it while it is healthy and falls back to
+// the conference path without resetting sessions when it is not.
+func (c *Client) directPathLoop(ctx context.Context) {
+	if !directpath.ClientEnabled() {
+		return
+	}
+	la, ok := c.ln.(directpath.LinkAttacher)
+	if !ok {
+		return
+	}
+	wait := 3 * time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		path, err := c.negotiateDirect(ctx)
+		switch {
+		case errors.Is(err, directpath.ErrUnsupported):
+			logger.Infof("direct path: not offered by server; staying on the conference path")
+			wait = 10 * time.Minute
+			continue
+		case err != nil:
+			logger.Infof("direct path: %v", err)
+			wait = min(max(wait*2, 15*time.Second), 5*time.Minute)
+			continue
+		}
+		if !la.AttachDirectPath(path) {
+			path.Close()
+			return
+		}
+		logger.Infof("direct path: connected")
+		wait = 5 * time.Second
+		select {
+		case <-ctx.Done():
+			path.Close()
+			return
+		case <-path.Done():
+			logger.Infof("direct path: lost; renegotiating")
+		}
+	}
+}
+
+func (c *Client) negotiateDirect(ctx context.Context) (*directpath.Path, error) {
+	c.sessMu.RLock()
+	sess := c.session
+	c.sessMu.RUnlock()
+	if sess == nil || sess.IsClosed() {
+		return nil, errors.New("tunnel session not ready")
+	}
+	stream, err := sess.OpenStream()
+	if err != nil {
+		return nil, fmt.Errorf("open signalling stream: %w", err)
+	}
+	defer func() { _ = stream.Close() }()
+	req, err := json.Marshal(map[string]any{"cmd": directpath.Command, "clientId": c.clientID})
+	if err != nil {
+		return nil, fmt.Errorf("marshal direct request: %w", err)
+	}
+	_ = stream.SetDeadline(time.Now().Add(30 * time.Second))
+	if _, err := stream.Write(req); err != nil {
+		return nil, fmt.Errorf("write direct request: %w", err)
+	}
+	ack := make([]byte, 1)
+	if _, err := io.ReadFull(stream, ack); err != nil {
+		return nil, fmt.Errorf("read direct ack: %w", err)
+	}
+	if ack[0] != directpath.AckSupported {
+		return nil, directpath.ErrUnsupported
+	}
+	offerer, offer, err := directpath.NewOfferer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := directpath.WriteBlob(stream, []byte(offer)); err != nil {
+		offerer.Abort()
+		return nil, err
+	}
+	answer, err := directpath.ReadBlob(stream)
+	if err != nil || len(answer) == 0 {
+		offerer.Abort()
+		return nil, fmt.Errorf("no direct answer: %w", err)
+	}
+	_ = stream.SetDeadline(time.Time{})
+	return offerer.Finish(ctx, string(answer))
 }
 
 func (c *Client) bringUpLink(
