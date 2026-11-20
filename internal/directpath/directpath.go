@@ -434,12 +434,20 @@ func withCandidates(sdp string, lines []string) string {
 	return strings.Join(out, nl) + nl
 }
 
+// defaultSCTPMinCwnd is the SCTP congestion window floor (bytes).
+const defaultSCTPMinCwnd = 128 * 1024
+
 // tuneSCTP sets the data channel's SCTP knobs (env overrides for tuning).
 func tuneSCTP(e *webrtc.SettingEngine) {
 	if v := envUint("OLCRTC_SCTP_RCVBUF", 0); v > 0 {
 		e.SetSCTPMaxReceiveBufferSize(v)
 	}
-	if v := envUint("OLCRTC_SCTP_MIN_CWND", 0); v > 0 {
+	// SCTP's congestion window must not collapse: after a timeout it drops
+	// to one packet, and the reverse direction (the receiver's KCP acks)
+	// then crawls one packet per delayed SACK (200 ms), stalling the
+	// sender for whole seconds. KCP above repairs losses and the direct
+	// path controller paces the rate, so SCTP's own backoff only hurts.
+	if v := envUint("OLCRTC_SCTP_MIN_CWND", defaultSCTPMinCwnd); v > 0 {
 		e.SetSCTPMinCwnd(v)
 	}
 	if v := envUint("OLCRTC_SCTP_CA_STEP", 0); v > 0 {

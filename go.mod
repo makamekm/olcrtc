@@ -97,3 +97,5 @@ require (
 )
 
 replace github.com/wlynxg/anet => ./internal/compat/anet
+
+replace github.com/pion/sctp => ./third_party/pion-sctp
