@@ -3,8 +3,11 @@ package directpath
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/pion/webrtc/v4"
 )
 
 func TestDirectPathCarriesFramesBothWays(t *testing.T) {
@@ -73,5 +76,40 @@ func TestServerDisabledWithoutPort(t *testing.T) {
 	srv, err := ServerFromEnv(context.Background())
 	if srv != nil || err != nil {
 		t.Fatalf("expected disabled server, got %v %v", srv, err)
+	}
+}
+
+func TestAnswerAdvertisesThePublicAddressOnTheForwardedPort(t *testing.T) {
+	t.Setenv(EnvPort, "40777")
+	t.Setenv(EnvPublicIP, "203.0.113.7")
+	t.Setenv(EnvNATPMP, "0")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, err := ServerFromEnv(ctx)
+	if err != nil || s == nil {
+		t.Fatalf("server: %v", err)
+	}
+	o, offer, err := NewOfferer(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Abort()
+	p, answer, err := s.Answer(ctx, offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if !strings.Contains(answer, "203.0.113.7 40777 typ host\r\n") ||
+		!strings.Contains(answer, "203.0.113.7 40777 typ host tcptype passive") {
+		t.Fatalf("public candidate missing:\n%s", answer)
+	}
+	for _, l := range strings.Split(answer, "\r\n") {
+		if strings.Contains(l, "203.0.113.7") && !strings.Contains(l, " 40777 ") {
+			t.Fatalf("public address on another port: %s", l)
+		}
+	}
+	// The answer must still be acceptable to the client.
+	if err := o.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}); err != nil {
+		t.Fatalf("client rejects answer: %v", err)
 	}
 }

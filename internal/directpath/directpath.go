@@ -313,10 +313,10 @@ func ServerFromEnv(ctx context.Context) (*Server, error) {
 	engine.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udp))
 	engine.SetICETCPMux(webrtc.NewICETCPMux(nil, tcp, 64))
 	engine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4, webrtc.NetworkTypeTCP4})
-	if s.publicIP != "" {
-		// Keep LAN host candidates and add the public address on top.
-		engine.SetNAT1To1IPs([]string{s.publicIP}, webrtc.ICECandidateTypeSrflx)
-	}
+	// The public address is added to each answer by publicCandidates rather
+	// than through SetNAT1To1IPs: pion gathers that srflx candidate on a fresh
+	// random port instead of the muxed one, so behind a port forward (Docker,
+	// NAT-PMP) clients were sent to a port nobody forwards and never connected.
 	s.api = webrtc.NewAPI(webrtc.WithSettingEngine(engine))
 	go func() {
 		<-ctx.Done()
@@ -352,6 +352,7 @@ func (s *Server) Answer(ctx context.Context, offerSDP string) (*Path, string, er
 		return nil, "", fmt.Errorf("set local answer: %w", err)
 	}
 	gatherComplete(ctx, pc)
+	sdp := withCandidates(pc.LocalDescription().SDP, publicCandidates(s.publicIP, s.port))
 	go func() {
 		select {
 		case <-ready:
@@ -360,7 +361,52 @@ func (s *Server) Answer(ctx context.Context, offerSDP string) (*Path, string, er
 			path.Close()
 		}
 	}()
-	return path, pc.LocalDescription().SDP, nil
+	return path, sdp, nil
+}
+
+// publicCandidates advertises the forwarded port on the public address, UDP
+// first. Host type, so they rank right after the real interface addresses.
+func publicCandidates(ip string, port int) []string {
+	if ip == "" || port == 0 {
+		return nil
+	}
+	return []string{
+		fmt.Sprintf("a=candidate:7001 1 udp 2130680831 %s %d typ host", ip, port),
+		fmt.Sprintf("a=candidate:7002 1 tcp 1671404543 %s %d typ host tcptype passive", ip, port),
+	}
+}
+
+// withCandidates inserts candidate lines into every media section, before
+// its end-of-candidates marker (or at its end).
+func withCandidates(sdp string, lines []string) string {
+	if len(lines) == 0 {
+		return sdp
+	}
+	nl := "\n"
+	if strings.Contains(sdp, "\r\n") {
+		nl = "\r\n"
+	}
+	src := strings.Split(strings.TrimRight(sdp, nl), nl)
+	var out []string
+	inMedia, added := false, false
+	flush := func() {
+		if inMedia && !added {
+			out = append(out, lines...)
+		}
+	}
+	for _, l := range src {
+		if strings.HasPrefix(l, "m=") {
+			flush()
+			inMedia, added = true, false
+		}
+		if inMedia && !added && l == "a=end-of-candidates" {
+			out = append(out, lines...)
+			added = true
+		}
+		out = append(out, l)
+	}
+	flush()
+	return strings.Join(out, nl) + nl
 }
 
 func nonEmpty(v, fallback string) string {
