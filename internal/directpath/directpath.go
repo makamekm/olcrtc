@@ -292,6 +292,23 @@ func ServerFromEnv(ctx context.Context) (*Server, error) {
 			}
 		}
 	}
+	source := "env"
+	switch {
+	case s.publicIP != "" && os.Getenv(EnvPublicIP) == "":
+		source = "nat-pmp"
+	case s.publicIP == "":
+		if ip := interfacePublicIPv4(); ip != "" {
+			// The address is on an interface, so host candidates already
+			// carry it; nothing to advertise on top.
+			source = "interface " + ip
+		} else if ip, err := stunPublicIPv4(); err == nil {
+			s.publicIP = ip
+			source = "stun"
+		} else {
+			source = "unknown"
+			logger.Infof("directpath: public address unknown (%v); set %s or forward the port", err, EnvPublicIP)
+		}
+	}
 	engine := webrtc.SettingEngine{}
 	engine.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udp))
 	engine.SetICETCPMux(webrtc.NewICETCPMux(nil, tcp, 64))
@@ -306,7 +323,7 @@ func ServerFromEnv(ctx context.Context) (*Server, error) {
 		_ = udp.Close()
 		_ = tcp.Close()
 	}()
-	logger.Infof("directpath: server listening on udp/tcp %d public=%s", port, nonEmpty(s.publicIP, "unknown"))
+	logger.Infof("directpath: server listening on udp/tcp %d public=%s (%s)", port, nonEmpty(s.publicIP, "-"), source)
 	return s, nil
 }
 
