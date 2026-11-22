@@ -1116,10 +1116,9 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 				// previously selected stale epoch must not enter the new KCP runtime.
 				return
 			}
-		} else if p.localReconnectAt.Swap(0) != 0 {
-			// The carrier reconnect callback already replaced KCP. The first epoch
-			// exposed by the rejoined remote track belongs to that fresh runtime, so
-			// adopt it without tearing KCP down a second time.
+		} else if reconnectAt := p.localReconnectAt.Swap(0); reconnectAt > p.lastIngressAt.Load() {
+			// The carrier already replaced KCP. Reuse that session only if
+			// no peer traffic has arrived since the reconnect.
 			if p.promotePeerEpoch(prev, peerEpoch) {
 				logger.Infof("vp8channel: peer epoch accepted after local reconnect prev=0x%08x next=0x%08x - keeping fresh KCP", prev, peerEpoch)
 			}

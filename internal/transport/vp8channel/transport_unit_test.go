@@ -340,20 +340,20 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 		t.Fatal("previous local epoch must still be recognised as self-echo")
 	}
 	reconnected = false
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 2, []byte("initial-switch")))
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 2, nil))
 	if reconnected || tr.peerEpoch.Load() != 2 {
 		t.Fatalf("initial epoch switch should adopt without reconnect: reconnected=%v epoch=%d", reconnected, tr.peerEpoch.Load()) //nolint:lll // long test description
 	}
 	tr.firstPeerAt.Store(time.Now().Add(-11 * time.Second).UnixNano())
+	beforeKCP := tr.kcp
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 3, []byte("after-local-reconnect")))
-	if reconnected || tr.peerEpoch.Load() != 3 || tr.kcp == nil {
-		t.Fatalf("epoch change after local reconnect should reset KCP without callback: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+	if reconnected || tr.peerEpoch.Load() != 3 || tr.kcp != beforeKCP {
+		t.Fatalf("epoch change after local reconnect should keep the fresh KCP: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp)
 	}
-	tr.localReconnectAt.Store(0)
 	reconnected = false
 	tr.lastEpochReset.Store(time.Now().UnixNano())
 	tr.inFrames.Store(0)
-	beforeKCP := tr.kcp
+	beforeKCP = tr.kcp
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 4, []byte("zero-ingress-remote-restart")))
 	if reconnected || tr.peerEpoch.Load() != 4 || tr.kcp == beforeKCP {
 		t.Fatalf("zero-ingress epoch change should adopt with KCP reset: reconnected=%v epoch=%d kcp=%v before=%v", reconnected, tr.peerEpoch.Load(), tr.kcp, beforeKCP) //nolint:lll // long test description
@@ -370,9 +370,13 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	}
 
 	reconnected = false
-	tr.lastEpochReset.Store(time.Now().UnixNano())
+	now := time.Now()
+	tr.lastEpochReset.Store(now.UnixNano())
+	// The previous peer carried traffic after the carrier rejoined, but
+	// the reconnect marker is still set when another peer session arrives.
+	tr.localReconnectAt.Store(now.Add(-time.Minute).UnixNano())
 	tr.inFrames.Store(10)
-	tr.lastIngressAt.Store(time.Now().Add(-21 * time.Second).UnixNano())
+	tr.lastIngressAt.Store(now.Add(-21 * time.Second).UnixNano())
 	beforeKCP = tr.kcp
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 6, []byte("frozen-ingress-remote-restart")))
 	// A peer that restarted after carrying traffic needs a fresh smux session
