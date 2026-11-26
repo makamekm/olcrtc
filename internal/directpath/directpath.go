@@ -232,6 +232,12 @@ type Offerer struct {
 // NewOfferer creates the client peer connection and its local offer.
 func NewOfferer(ctx context.Context) (*Offerer, string, error) {
 	engine := webrtc.SettingEngine{}
+	// Enable active ICE-TCP for servers advertising a passive TCP candidate.
+	engine.SetNetworkTypes([]webrtc.NetworkType{
+		webrtc.NetworkTypeUDP4,
+		webrtc.NetworkTypeUDP6,
+		webrtc.NetworkTypeTCP4,
+	})
 	tuneSCTP(&engine)
 	pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(engine)).NewPeerConnection(webrtc.Configuration{ICEServers: clientSTUN})
 	if err != nil {

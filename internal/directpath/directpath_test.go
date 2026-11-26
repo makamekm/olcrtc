@@ -3,6 +3,7 @@ package directpath
 import (
 	"bytes"
 	"context"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -111,5 +112,69 @@ func TestAnswerAdvertisesThePublicAddressOnTheForwardedPort(t *testing.T) {
 	// The answer must still be acceptable to the client.
 	if err := o.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}); err != nil {
 		t.Fatalf("client rejects answer: %v", err)
+	}
+}
+
+func TestDirectPathFallsBackToTCP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	engine := webrtc.SettingEngine{}
+	engine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeTCP4})
+	engine.SetICETCPMux(webrtc.NewICETCPMux(nil, listener, 64))
+	tuneSCTP(&engine)
+	server := &Server{
+		api:  webrtc.NewAPI(webrtc.WithSettingEngine(engine)),
+		port: listener.Addr().(*net.TCPAddr).Port,
+	}
+
+	offerer, offer, err := NewOfferer(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer offerer.Abort()
+	serverPath, answer, err := server.Answer(ctx, offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverPath.Close()
+
+	toServer := make(chan string, 1)
+	serverPath.OnFrame(func(frame []byte) { toServer <- string(frame) })
+	clientPath, err := offerer.Finish(ctx, answer)
+	if err != nil {
+		t.Fatalf("TCP-only negotiation: %v", err)
+	}
+	defer clientPath.Close()
+	toClient := make(chan string, 1)
+	clientPath.OnFrame(func(frame []byte) { toClient <- string(frame) })
+
+	if !clientPath.Send([]byte("to-server")) {
+		t.Fatal("client could not send over TCP")
+	}
+	select {
+	case frame := <-toServer:
+		if frame != "to-server" {
+			t.Fatalf("server got %q", frame)
+		}
+	case <-ctx.Done():
+		t.Fatal("server never received the TCP frame")
+	}
+	if !serverPath.Send([]byte("to-client")) {
+		t.Fatal("server could not send over TCP")
+	}
+	select {
+	case frame := <-toClient:
+		if frame != "to-client" {
+			t.Fatalf("client got %q", frame)
+		}
+	case <-ctx.Done():
+		t.Fatal("client never received the TCP frame")
 	}
 }
