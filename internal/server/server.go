@@ -59,6 +59,8 @@ type Server struct {
 	socksProxyPort  int
 	// direct accepts peer-to-peer data channels (nil when disabled).
 	direct *directpath.Server
+	// A short-lived direct path can repeatedly stall the conference backup.
+	directRetryAt atomic.Int64
 	// sniRouting is on while the configured resolver answers with router
 	// bypass (synthetic 198.18.0.0/15) addresses; see probeSyntheticDNS.
 	sniRouting atomic.Bool
@@ -496,6 +498,11 @@ func (s *Server) dispatchDirect(stream *smux.Stream) {
 		logger.Infof("sid=%d direct offer: %v", stream.ID(), err)
 		return
 	}
+	if time.Now().UnixNano() < s.directRetryAt.Load() {
+		logger.Infof("sid=%d direct path cooling down after short-lived connection", stream.ID())
+		_ = directpath.WriteBlob(stream, nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	path, answer, err := s.direct.Answer(ctx, string(offer))
@@ -513,6 +520,13 @@ func (s *Server) dispatchDirect(stream *smux.Stream) {
 		return
 	}
 	logger.Infof("sid=%d direct path negotiated", stream.ID())
+	connected := time.Now()
+	go func() {
+		<-path.Done()
+		if time.Since(connected) < 20*time.Second {
+			s.directRetryAt.Store(time.Now().Add(30 * time.Second).UnixNano())
+		}
+	}()
 }
 
 // shouldRouteBySNI reports whether an HTTPS connection to a bare public IP

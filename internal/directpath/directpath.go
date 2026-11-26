@@ -65,6 +65,7 @@ type Path struct {
 	pc                     *webrtc.PeerConnection
 	dc                     *webrtc.DataChannel
 	open                   atomic.Bool
+	disconnected           atomic.Bool
 	lastRecv               atomic.Int64
 	onFrame                atomic.Pointer[func([]byte)]
 	done                   chan struct{}
@@ -108,7 +109,7 @@ func (p *Path) OnFrame(fn func([]byte)) { p.onFrame.Store(&fn) }
 
 // Healthy reports whether frames should be routed over this path.
 func (p *Path) Healthy() bool {
-	if p == nil || !p.open.Load() {
+	if p == nil || !p.open.Load() || p.disconnected.Load() {
 		return false
 	}
 	select {
@@ -194,6 +195,11 @@ func (p *Path) pingLoop() {
 func watchState(pc *webrtc.PeerConnection, path *Path) {
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		logger.Infof("directpath: peer connection %s", state)
+		if state == webrtc.PeerConnectionStateDisconnected {
+			path.disconnected.Store(true)
+		} else if state == webrtc.PeerConnectionStateConnected {
+			path.disconnected.Store(false)
+		}
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
 			path.Close()
 		}

@@ -2,7 +2,6 @@ package server
 
 import (
 	"errors"
-	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
 	"io"
 	"net"
 	"os"
@@ -10,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/openlibrecommunity/olcrtc/internal/lanaccess"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/xtaci/smux"
 )
@@ -28,7 +28,10 @@ func dnsRedirectEnabled() bool { return os.Getenv("OLCRTC_DNS_REDIRECT") == "1" 
 // server: UDP is relayed straight from the server, so QUIC would bypass that
 // routing (and from Russia QUIC to foreign services is throttled). A quick
 // refusal makes apps fall back to TCP at once instead of waiting on QUIC.
-func udpDeniedPort(port int) bool {
+func udpDeniedPort(port int, redirectedDNS bool) bool {
+	if os.Getenv("OLCRTC_UDP_DNS_ONLY") == "1" && !redirectedDNS {
+		return true
+	}
 	for _, f := range strings.Split(os.Getenv("OLCRTC_UDP_DENY_PORTS"), ",") {
 		if p, err := strconv.Atoi(strings.TrimSpace(f)); err == nil && p == port {
 			return true
@@ -38,18 +41,20 @@ func udpDeniedPort(port int) bool {
 }
 
 func (s *Server) dispatchUDP(stream *smux.Stream, req ConnectRequest) {
+	redirectedDNS := false
 	if req.Port == 53 && s.dnsServer != "" && dnsRedirectEnabled() {
 		if host, port, err := net.SplitHostPort(s.dnsServer); err == nil {
 			if p, err := strconv.Atoi(port); err == nil {
 				req.Addr, req.Port = host, p
+				redirectedDNS = host != "" && p > 0 && p <= 65535
 			}
 		}
 	}
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
 	logger.Debugf("sid=%d udp %s", stream.ID(), addr)
 
-	if udpDeniedPort(req.Port) {
-		logger.Debugf("sid=%d udp %s refused by OLCRTC_UDP_DENY_PORTS", stream.ID(), addr)
+	if udpDeniedPort(req.Port, redirectedDNS) {
+		logger.Debugf("sid=%d udp %s refused by server routing policy", stream.ID(), addr)
 		_, _ = stream.Write([]byte{0x01})
 		return
 	}
