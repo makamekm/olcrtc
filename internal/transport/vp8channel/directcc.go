@@ -151,11 +151,18 @@ func (p *streamTransport) runDirectCC(path *directpath.Path) {
 		return
 	}
 	var st ccState
+	var health directHealth
+	var lastRuntime *kcpRuntime
 	t := time.NewTicker(ccTick)
 	defer t.Stop()
-	defer p.restoreKCPDefaults()
+	defer func() {
+		if current := p.direct.Load(); current == nil || current == path {
+			p.restoreKCPDefaults()
+		}
+	}()
 	lastLog := time.Now()
 	var lastSent, lastRecv uint64
+	var lastNoStandby time.Time
 	for {
 		select {
 		case <-path.Done():
@@ -163,10 +170,16 @@ func (p *streamTransport) runDirectCC(path *directpath.Path) {
 		case <-p.closeCh:
 			return
 		case now := <-t.C:
-			if p.direct.Load() != path || !path.Healthy() {
+			if p.direct.Load() != path {
+				return
+			}
+			if !path.Healthy() {
 				// Traffic is back on the conference path: its own settings.
-				p.restoreKCPDefaults()
-				st = ccState{}
+				if st.wnd != 0 {
+					p.restoreKCPDefaults()
+					st = ccState{}
+					health = directHealth{}
+				}
 				continue
 			}
 			p.kcpMu.RLock()
@@ -175,10 +188,28 @@ func (p *streamTransport) runDirectCC(path *directpath.Path) {
 			if rt == nil {
 				continue
 			}
+			if rt != lastRuntime {
+				lastRuntime = rt
+				health = directHealth{}
+			}
 			srtt := time.Duration(rt.sess.GetSRTT()) * time.Millisecond
 			snmp := kcp.DefaultSnmp
-			wnd := st.step(now, srtt, p.directOutBytes.Load(),
-				atomic.LoadUint64(&snmp.OutSegs), atomic.LoadUint64(&snmp.RetransSegs), kcpMTU)
+			out := atomic.LoadUint64(&snmp.OutSegs)
+			retrans := atomic.LoadUint64(&snmp.RetransSegs)
+			wnd := st.step(now, srtt, p.directOutBytes.Load(), out, retrans, kcpMTU)
+			if p.serverRole {
+				if reason := health.check(now, wnd, out, retrans, rt.completedWrites.Load(), rt.pendingWrites.Load() > 0); reason != "" {
+					if p.hasConferenceTraffic(now) {
+						logger.Infof("vp8channel: direct path degraded (%s, KCP RTT %v); falling back to conference", reason, srtt)
+						path.Degrade()
+						return
+					}
+					if now.Sub(lastNoStandby) >= 10*time.Second {
+						logger.Infof("vp8channel: direct path degraded (%s); conference ingress is unavailable", reason)
+						lastNoStandby = now
+					}
+				}
+			}
 			rt.sess.SetWindowSize(wnd, kcpRcvWnd)
 			p.ccWnd.Store(int32(wnd)) //nolint:gosec // bounded by ccMaxWnd
 			if ccTrace && now.Sub(lastLog) >= time.Second {

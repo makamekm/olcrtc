@@ -66,6 +66,7 @@ type Path struct {
 	dc                     *webrtc.DataChannel
 	open                   atomic.Bool
 	disconnected           atomic.Bool
+	degraded               atomic.Bool
 	lastRecv               atomic.Int64
 	onFrame                atomic.Pointer[func([]byte)]
 	done                   chan struct{}
@@ -162,6 +163,15 @@ func (p *Path) Done() <-chan struct{} { return p.done }
 
 // Stats returns frames sent and received over the path.
 func (p *Path) Stats() (sent, received uint64) { return p.sentFrames.Load(), p.recvFrames.Load() }
+
+// Degrade retires a connected path whose data delivery has stopped or declined.
+func (p *Path) Degrade() {
+	p.degraded.Store(true)
+	p.Close()
+}
+
+// Degraded reports whether the path was retired for poor data delivery.
+func (p *Path) Degraded() bool { return p.degraded.Load() }
 
 // Close tears the path down.
 func (p *Path) Close() {

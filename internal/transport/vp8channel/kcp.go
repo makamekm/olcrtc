@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	kcp "github.com/xtaci/kcp-go/v5"
 )
@@ -65,11 +66,13 @@ var ErrKCPMessageTooLarge = errors.New("vp8channel: kcp message exceeds maximum 
 // kcpRuntime owns the KCP session and the goroutine that pumps reassembled
 // messages from KCP up to cfg.OnData.
 type kcpRuntime struct {
-	conn      *kcpConn
-	sess      *kcp.UDPSession
-	readDone  chan struct{}
-	writeMu   sync.Mutex // serializes length-prefix + payload writes
-	closeOnce sync.Once
+	conn            *kcpConn
+	sess            *kcp.UDPSession
+	readDone        chan struct{}
+	writeMu         sync.Mutex // serializes length-prefix + payload writes
+	pendingWrites   atomic.Int32
+	completedWrites atomic.Uint64
+	closeOnce       sync.Once
 }
 
 func startKCP(out chan<- []byte, onData func([]byte), epochHdr [epochHdrLen]byte) (*kcpRuntime, error) {
@@ -148,6 +151,8 @@ func (r *kcpRuntime) send(msg []byte) error {
 	var hdr [kcpLenPrefix]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(msg))) //nolint:gosec,lll // G115: bounded conversion verified by surrounding logic
 
+	r.pendingWrites.Add(1)
+	defer r.pendingWrites.Add(-1)
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
@@ -157,6 +162,7 @@ func (r *kcpRuntime) send(msg []byte) error {
 	if _, err := r.sess.Write(msg); err != nil {
 		return fmt.Errorf("kcp write payload: %w", err)
 	}
+	r.completedWrites.Add(1)
 	return nil
 }
 

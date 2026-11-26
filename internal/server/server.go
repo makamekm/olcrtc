@@ -523,7 +523,7 @@ func (s *Server) dispatchDirect(stream *smux.Stream) {
 	connected := time.Now()
 	go func() {
 		<-path.Done()
-		if time.Since(connected) < 20*time.Second {
+		if path.Degraded() || time.Since(connected) < 20*time.Second {
 			s.directRetryAt.Store(time.Now().Add(30 * time.Second).UnixNano())
 		}
 	}()

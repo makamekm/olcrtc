@@ -159,6 +159,7 @@ type streamTransport struct {
 	lastStats           atomic.Int64
 	lastEpochReset      atomic.Int64
 	lastIngressAt       atomic.Int64
+	conferenceIngressAt atomic.Int64
 	localReconnectAt    atomic.Int64
 	firstPeerAt         atomic.Int64
 
@@ -1033,8 +1034,15 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 		if frame == nil {
 			continue
 		}
-		p.handleIncomingFrame(frame)
+		if p.handleIncomingFrame(frame) {
+			p.conferenceIngressAt.Store(time.Now().UnixNano())
+		}
 	}
+}
+
+func (p *streamTransport) hasConferenceTraffic(now time.Time) bool {
+	last := p.conferenceIngressAt.Load()
+	return last != 0 && time.Duration(now.UnixNano()-last) <= 6*time.Second
 }
 
 func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
@@ -1057,7 +1065,7 @@ func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
 // handleIncomingFrame parses the epoch header and either delivers the KCP
 // payload to the local session or triggers a reset when the peer's epoch
 // changes (peer process restart).
-func (p *streamTransport) handleIncomingFrame(frame []byte) {
+func (p *streamTransport) handleIncomingFrame(frame []byte) bool {
 	frameToken := binary.BigEndian.Uint32(frame[tokenOff:epochOff])
 	expectedToken := p.expectedPeerBindingToken()
 	isDirectional := frameToken == expectedToken
@@ -1065,11 +1073,11 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	if !isDirectional && (!isLegacy || p.directionalPeerSeen.Load()) {
 		logger.Debugf("vp8channel: frame token mismatch got=0x%08x want=0x%08x (foreign client or noise)",
 			frameToken, expectedToken)
-		return
+		return false
 	}
 	if p.servedOtherSession(frame) {
 		logger.Debugf("vp8channel: dropping server frame addressed to a previous client session")
-		return
+		return false
 	}
 	peerEpoch := binary.BigEndian.Uint32(frame[epochOff:epochHdrLen])
 	kcpPayload := frame[epochHdrLen:]
@@ -1090,7 +1098,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	// "peer" and both sides loop forever resetting smux/KCP.
 	if p.isOwnEpoch(peerEpoch) {
 		logger.Debugf("vp8channel: self-echo detected epoch=0x%08x (SFU reflects our own track)", peerEpoch)
-		return
+		return false
 	}
 
 	if !p.hadPeer.Swap(true) {
@@ -1114,7 +1122,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 			} else {
 				// Once the current SFU track has been promoted, frames from the
 				// previously selected stale epoch must not enter the new KCP runtime.
-				return
+				return false
 			}
 		} else if reconnectAt := p.localReconnectAt.Swap(0); reconnectAt > p.lastIngressAt.Load() {
 			// The carrier already replaced KCP. Reuse that session only if
@@ -1138,25 +1146,26 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 				}
 			}
 		} else {
-			return
+			return false
 		}
 	}
 	if peerEpoch != p.peerEpoch.Load() {
-		return
+		return false
 	}
 
 	if len(kcpPayload) == 0 {
-		return
+		return false
 	}
 	if len(kcpPayload) >= 6 && binary.BigEndian.Uint32(kcpPayload[0:4]) == batchMagic {
 		if binary.BigEndian.Uint16(kcpPayload[4:6]) == 0 {
 			p.markIdleIngress()
-			return
+			return true
 		}
 		p.handleIncomingBatch(kcpPayload)
-		return
+		return true
 	}
 	p.deliverKCPPacket(kcpPayload)
+	return true
 }
 
 func (p *streamTransport) peerIngressIdle(now int64) bool {
