@@ -3,8 +3,10 @@ package vp8channel
 import "time"
 
 const (
-	directLossInterval = time.Second
-	directStalledWrite = 4 * time.Second
+	directLossInterval    = time.Second
+	directStalledWrite    = 4 * time.Second
+	conferenceProbePeriod = 3 * time.Second
+	conferenceFreshFor    = 6 * time.Second
 )
 
 // directHealth detects sustained problems with payload delivery that ICE
@@ -45,4 +47,19 @@ func (h *directHealth) check(now time.Time, wnd int, out, retrans, accepted uint
 		return "sustained retransmissions at minimum window"
 	}
 	return ""
+}
+
+// conferenceProbe sends on the alternate route while the direct path is
+// still available to the peer. A keepalive received before the switch can
+// come from a track that has already stopped delivering.
+type conferenceProbe struct {
+	start  time.Time
+	reason string
+}
+
+func (p conferenceProbe) result(now time.Time, latest int64) (finished, confirmed bool) {
+	if now.Sub(p.start) < conferenceProbePeriod {
+		return false, false
+	}
+	return true, latest >= p.start.Add(conferenceProbePeriod/2).UnixNano() && time.Duration(now.UnixNano()-latest) <= conferenceFreshFor
 }

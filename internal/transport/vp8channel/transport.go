@@ -175,6 +175,8 @@ type streamTransport struct {
 	// direct is the optional peer-to-peer data channel; KCP packets prefer it
 	// while it is healthy and fall back to the conference path otherwise.
 	direct atomic.Pointer[directpath.Path]
+	// A probe diverts outbound frames without detaching the direct receiver.
+	conferenceProbePath atomic.Pointer[directpath.Path]
 	// ownEpochs remembers every epoch this process has published so SFU
 	// reflections of an earlier local session still count as self-echo.
 	ownEpochs sync.Map
@@ -870,7 +872,7 @@ func (p *streamTransport) DirectPathActive() bool { return p.direct.Load().Healt
 
 func (p *streamTransport) trySendDirect(frame []byte) bool {
 	path := p.direct.Load()
-	if path == nil || !path.Healthy() {
+	if path == nil || p.conferenceProbePath.Load() == path || !path.Healthy() {
 		return false
 	}
 	if p.serverRole {
@@ -1042,7 +1044,7 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 
 func (p *streamTransport) hasConferenceTraffic(now time.Time) bool {
 	last := p.conferenceIngressAt.Load()
-	return last != 0 && time.Duration(now.UnixNano()-last) <= 6*time.Second
+	return last != 0 && time.Duration(now.UnixNano()-last) <= conferenceFreshFor
 }
 
 func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {

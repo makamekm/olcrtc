@@ -123,3 +123,27 @@ switched:
 		t.Fatal(err)
 	}
 }
+
+func TestConferenceProbeRequiresMoreRecentIngressBeforeRetiringDirect(t *testing.T) {
+	at := time.Unix(100, 0)
+	trial := conferenceProbe{start: at}
+	cases := []struct {
+		name                string
+		now, received       time.Time
+		finished, confirmed bool
+	}{
+		{"during probe", at.Add(time.Second), at.Add(time.Second), false, false},
+		{"early keepalive only", at.Add(conferenceProbePeriod), at.Add(time.Second), true, false},
+		{"old keepalive", at.Add(conferenceProbePeriod), at.Add(-time.Second), true, false},
+		{"continuing ingress", at.Add(conferenceProbePeriod), at.Add(2 * time.Second), true, true},
+		{"ingress went stale", at.Add(10 * time.Second), at.Add(time.Second), true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			finished, confirmed := trial.result(tc.now, tc.received.UnixNano())
+			if finished != tc.finished || confirmed != tc.confirmed {
+				t.Fatalf("got finished=%v confirmed=%v", finished, confirmed)
+			}
+		})
+	}
+}

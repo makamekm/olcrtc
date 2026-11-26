@@ -152,10 +152,12 @@ func (p *streamTransport) runDirectCC(path *directpath.Path) {
 	}
 	var st ccState
 	var health directHealth
+	var probe conferenceProbe
 	var lastRuntime *kcpRuntime
 	t := time.NewTicker(ccTick)
 	defer t.Stop()
 	defer func() {
+		p.conferenceProbePath.CompareAndSwap(path, nil)
 		if current := p.direct.Load(); current == nil || current == path {
 			p.restoreKCPDefaults()
 		}
@@ -174,6 +176,8 @@ func (p *streamTransport) runDirectCC(path *directpath.Path) {
 				return
 			}
 			if !path.Healthy() {
+				p.conferenceProbePath.CompareAndSwap(path, nil)
+				probe = conferenceProbe{}
 				// Traffic is back on the conference path: its own settings.
 				if st.wnd != 0 {
 					p.restoreKCPDefaults()
@@ -190,9 +194,26 @@ func (p *streamTransport) runDirectCC(path *directpath.Path) {
 			}
 			if rt != lastRuntime {
 				lastRuntime = rt
+				p.conferenceProbePath.CompareAndSwap(path, nil)
+				probe = conferenceProbe{}
 				health = directHealth{}
 			}
 			srtt := time.Duration(rt.sess.GetSRTT()) * time.Millisecond
+			if !probe.start.IsZero() {
+				finished, confirmed := probe.result(now, p.conferenceIngressAt.Load())
+				if !finished {
+					continue
+				}
+				if confirmed {
+					logger.Infof("vp8channel: direct path degraded (%s, KCP RTT %v); falling back to conference", probe.reason, srtt)
+					path.Degrade()
+					return
+				}
+				logger.Infof("vp8channel: conference stopped receiving during probe; keeping direct path")
+				p.conferenceProbePath.CompareAndSwap(path, nil)
+				probe = conferenceProbe{}
+				st, health = ccState{}, directHealth{}
+			}
 			snmp := kcp.DefaultSnmp
 			out := atomic.LoadUint64(&snmp.OutSegs)
 			retrans := atomic.LoadUint64(&snmp.RetransSegs)
@@ -200,9 +221,11 @@ func (p *streamTransport) runDirectCC(path *directpath.Path) {
 			if p.serverRole {
 				if reason := health.check(now, wnd, out, retrans, rt.completedWrites.Load(), rt.pendingWrites.Load() > 0); reason != "" {
 					if p.hasConferenceTraffic(now) {
-						logger.Infof("vp8channel: direct path degraded (%s, KCP RTT %v); falling back to conference", reason, srtt)
-						path.Degrade()
-						return
+						logger.Infof("vp8channel: testing conference before retiring degraded direct path (%s)", reason)
+						probe = conferenceProbe{start: now, reason: reason}
+						p.conferenceProbePath.Store(path)
+						p.restoreKCPDefaults()
+						continue
 					}
 					if now.Sub(lastNoStandby) >= 10*time.Second {
 						logger.Infof("vp8channel: direct path degraded (%s); conference ingress is unavailable", reason)
