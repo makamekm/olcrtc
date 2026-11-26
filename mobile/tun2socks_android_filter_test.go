@@ -49,12 +49,12 @@ func (m *memoryTun) Close() error {
 	return nil
 }
 
-func TestAndroidTunReadWriterRejectsNonDNSUDPWithICMP(t *testing.T) {
+func TestAndroidTunReadWriterRejectsQUICWithICMP(t *testing.T) {
 	resetMobileGlobals(t)
 	tun := newMemoryTun()
 	rw := newAndroidTunReadWriter(tun, 1280, "127.0.0.1", 10808)
 
-	packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, 443, []byte("quic"))
+	packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, 443, []byte{0xc0, 0, 0, 0, 1})
 	errCh := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 1280)
@@ -91,7 +91,7 @@ func TestPacketFlowReadWriterRejectsMediaUDP443WithICMP(t *testing.T) {
 	resetMobileGlobals(t)
 	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
 
-	packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, 443, []byte("quic"))
+	packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, 443, []byte{0xc0, 0, 0, 0, 1})
 	if err := rw.Inject(packet); err != nil {
 		t.Fatalf("Inject() error = %v", err)
 	}
@@ -122,11 +122,11 @@ func TestPacketFlowReadWriterRejectsMediaUDP443WithICMP(t *testing.T) {
 	}
 }
 
-func TestPacketFlowReadWriterRejectsRepeatedNonDNSUDP(t *testing.T) {
+func TestPacketFlowReadWriterRejectsRepeatedQUIC(t *testing.T) {
 	resetMobileGlobals(t)
 	rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
 
-	packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, 123, []byte("ntp"))
+	packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, 443, []byte{0xc0, 0, 0, 0, 1})
 	for i := 0; i < 2; i++ {
 		if err := rw.Inject(packet); err != nil {
 			t.Fatalf("Inject(%d) error = %v", i, err)
@@ -275,8 +275,8 @@ func injectUniqueUDPFlows(t *testing.T, rw *packetFlowReadWriter, start, count i
 			[4]byte{10, 8, byte(i / 200), byte(i + 2)},
 			[4]byte{93, 184, byte(i / 200), byte(34 + i)},
 			uint16(30000+i),
-			123,
-			[]byte("ntp"),
+			443,
+			[]byte{0xc0, 0, 0, 0, 1},
 		)
 		if err := rw.Inject(packet); err != nil {
 			t.Fatalf("Inject(%d) error = %v", i, err)
@@ -405,4 +405,34 @@ func tcpMSSOption(t *testing.T, packet []byte) uint16 {
 	}
 	t.Fatal("missing TCP MSS option")
 	return 0
+}
+
+func TestMobileForwardsCallUDP(t *testing.T) {
+	resetMobileGlobals(t)
+	for _, port := range []uint16{3478, 22466, 443} {
+		// STUN Binding Request header, including the magic cookie.
+		payload := []byte{0, 1, 0, 0, 0x21, 0x12, 0xa4, 0x42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+		packet := buildTestIPv4UDPPacket([4]byte{10, 8, 0, 2}, [4]byte{93, 184, 216, 34}, 55555, port, payload)
+		rw := newPacketFlowReadWriter(1280, "127.0.0.1", 10808)
+		if err := rw.Inject(packet); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case got := <-rw.inbound:
+			if len(got) != len(packet) {
+				t.Fatalf("forwarded %d bytes, want %d", len(got), len(packet))
+			}
+		default:
+			t.Fatalf("iOS did not forward call UDP to %d", port)
+		}
+		tun := newMemoryTun()
+		android := newAndroidTunReadWriter(tun, 1280, "127.0.0.1", 10808)
+		tun.reads <- packet
+		// If UDP is dropped, this packet lets Read return and fail the assertion.
+		tun.reads <- []byte{1}
+		if n, err := android.Read(make([]byte, 1280)); err != nil || n != len(packet) {
+			t.Fatalf("Android UDP %d: len=%d err=%v", port, n, err)
+		}
+		_ = android.Close()
+	}
 }

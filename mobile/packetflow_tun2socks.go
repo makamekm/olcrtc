@@ -226,16 +226,9 @@ func (rw *packetFlowReadWriter) Inject(packet []byte) error {
 	if rw.tryHandleDNS(packet) {
 		return nil
 	}
-	if isIPv4UDP(packet) && !rw.shouldForwardUDP(packet) {
-		// DNS is answered above. Non-DNS UDP is intentionally rejected in the
-		// iOS packet-flow bridge. Forwarding QUIC/media UDP/443 through SOCKS5
-		// UDP ASSOCIATE looks like activity in PacketTunnel counters but leaves
-		// real YouTube stuck on feed/player loading on current RUPN transports.
-		// Safari/WebKit can generate large bursts of UDP/443/QUIC probes under
-		// includeAllNetworks=true. Silent drops make YouTube/WebKit wait on QUIC
-		// timeouts before falling back to TCP; send ICMP port-unreachable through
-		// a replenishing per-window limiter so system apps fall back quickly
-		// without letting ICMP storms starve TCP responses.
+	if isIPv4HTTPSQUIC(packet) {
+		// Reject QUIC handshakes promptly so video moves to HTTPS over TCP.
+		// Other datagrams continue to SOCKS5 UDP ASSOCIATE for calls and games.
 		atomic.AddUint64(&rw.udpDropped, 1)
 		rw.recordUDPDropped(packet)
 		if rw.shouldRejectUDP(packet) {
@@ -431,8 +424,16 @@ func (rw *packetFlowReadWriter) udpDropSampleString() string {
 	return out
 }
 
-func (rw *packetFlowReadWriter) shouldForwardUDP(packet []byte) bool {
-	return false
+func isIPv4HTTPSQUIC(packet []byte) bool {
+	if !isIPv4UDPDstPort(packet, 443) {
+		return false
+	}
+	payload, ok := dnsPayloadFromIPv4UDP(packet)
+	if !ok || len(payload) < 5 || payload[0]&0xc0 != 0xc0 {
+		return false
+	}
+	version := binary.BigEndian.Uint32(payload[1:5])
+	return version == 1 || version == 0x6b3343cf || version>>8 == 0xff0000
 }
 
 func (rw *packetFlowReadWriter) shouldRejectUDP(packet []byte) bool {

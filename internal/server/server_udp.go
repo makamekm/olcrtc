@@ -65,6 +65,11 @@ func (s *Server) dispatchUDP(stream *smux.Stream, req ConnectRequest) {
 		return
 	}
 
+	if proxyAddr := os.Getenv("OLCRTC_UDP_SOCKS_PROXY"); proxyAddr != "" && !redirectedDNS {
+		s.dispatchRoutedUDP(stream, req, proxyAddr)
+		return
+	}
+
 	remote, err := net.ResolveUDPAddr("udp4", addr)
 	if err != nil {
 		logger.Infof("sid=%d udp resolve %s failed: %v", stream.ID(), addr, err)
@@ -128,4 +133,34 @@ func (s *Server) dispatchUDP(stream *smux.Stream, req ConnectRequest) {
 		}
 		_ = conn.SetWriteDeadline(time.Time{})
 	}
+}
+
+// dispatchRoutedUDP carries the existing length-prefixed datagrams to the
+// cluster router using its internal SOCKS command 0xf0.
+func (s *Server) dispatchRoutedUDP(stream *smux.Stream, req ConnectRequest, proxyAddr string) {
+	up, err := net.DialTimeout("tcp", proxyAddr, 3*time.Second)
+	if err != nil {
+		_, _ = stream.Write([]byte{0x01})
+		return
+	}
+	defer up.Close()
+	_ = up.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := socks5Request(up, 0xf0, req.Addr, req.Port); err != nil {
+		logger.Debugf("sid=%d UDP proxy %s:%d failed: %v", stream.ID(), req.Addr, req.Port, err)
+		_, _ = stream.Write([]byte{0x01})
+		return
+	}
+	_ = up.SetDeadline(time.Time{})
+	if _, err := stream.Write([]byte{0x00}); err != nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(stream, up)
+		_ = stream.Close()
+	}()
+	_, _ = io.Copy(up, stream)
+	_ = up.Close()
+	<-done
 }

@@ -641,6 +641,10 @@ func (s *Server) dial(req ConnectRequest) (net.Conn, error) {
 }
 
 func (s *Server) socks5Connect(conn net.Conn, targetAddr string, targetPort int) error {
+	return socks5Request(conn, 1, targetAddr, targetPort)
+}
+
+func socks5Request(conn net.Conn, command byte, targetAddr string, targetPort int) error {
 	if _, err := conn.Write([]byte{5, 1, 0}); err != nil {
 		return fmt.Errorf("failed to write socks5 auth: %w", err)
 	}
@@ -660,7 +664,7 @@ func (s *Server) socks5Connect(conn net.Conn, targetAddr string, targetPort int)
 	}
 
 	req := make([]byte, 0, 7+addrLen)
-	req = append(req, 5, 1, 0, 3, byte(addrLen))
+	req = append(req, 5, command, 0, 3, byte(addrLen))
 	req = append(req, []byte(targetAddr)...)
 	req = append(req, byte(targetPort>>8), byte(targetPort)) //nolint:gosec,lll // G115: bounded conversion verified by surrounding logic
 

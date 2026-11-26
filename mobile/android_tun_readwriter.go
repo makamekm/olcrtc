@@ -58,7 +58,7 @@ func (rw *androidTunReadWriter) Read(dst []byte) (int, error) {
 		if rw.tryHandleDNS(packet) {
 			continue
 		}
-		if isIPv4UDP(packet) {
+		if isIPv4HTTPSQUIC(packet) {
 			atomic.AddUint64(&rw.udpDropped, 1)
 			if resp, ok := buildIPv4ICMPPortUnreachable(packet); ok {
 				_ = rw.Respond(resp)
