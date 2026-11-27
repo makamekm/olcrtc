@@ -34,7 +34,7 @@ const (
 
 	// EnvPort enables the server side and fixes its UDP port.
 	EnvPort = "OLCRTC_DIRECT_PORT"
-	// EnvPublicIP overrides the advertised public address.
+	// EnvPublicIP overrides the advertised addresses in preference order, separated by commas.
 	EnvPublicIP = "OLCRTC_DIRECT_PUBLIC_IP"
 	// EnvNATPMP asks the LAN gateway to forward EnvPort ("0" disables).
 	EnvNATPMP = "OLCRTC_DIRECT_NATPMP"
@@ -411,16 +411,32 @@ func (s *Server) Answer(ctx context.Context, offerSDP string) (*Path, string, er
 	return path, sdp, nil
 }
 
-// publicCandidates advertises the forwarded port on the public address, UDP
-// first. Host type, so they rank right after the real interface addresses.
-func publicCandidates(ip string, port int) []string {
-	if ip == "" || port == 0 {
+// publicCandidates advertises the same forwarded port on each public address.
+// Prefer UDP and then the address order within each protocol.
+func publicCandidates(addresses string, port int) []string {
+	if port == 0 {
 		return nil
 	}
-	return []string{
-		fmt.Sprintf("a=candidate:7001 1 udp 2130680831 %s %d typ host", ip, port),
-		fmt.Sprintf("a=candidate:7002 1 tcp 1671404543 %s %d typ host tcptype passive", ip, port),
+	const maxAddresses = 8
+	var lines []string
+	seen := make(map[string]bool)
+	for _, address := range strings.Split(addresses, ",") {
+		ip := net.ParseIP(strings.TrimSpace(address))
+		if ip == nil || ip.To4() == nil || seen[ip.String()] {
+			continue
+		}
+		address = ip.String()
+		seen[address] = true
+		index := len(lines) / 2
+		lines = append(lines,
+			fmt.Sprintf("a=candidate:%d 1 udp %d %s %d typ host", 7001+2*index, 2130680831-256*index, address, port),
+			fmt.Sprintf("a=candidate:%d 1 tcp %d %s %d typ host tcptype passive", 7002+2*index, 1671404543-256*index, address, port),
+		)
+		if len(seen) == maxAddresses {
+			break
+		}
 	}
+	return lines
 }
 
 // withCandidates inserts candidate lines into every media section, before

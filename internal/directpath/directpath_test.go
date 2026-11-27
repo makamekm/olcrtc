@@ -178,3 +178,21 @@ func TestDirectPathFallsBackToTCP(t *testing.T) {
 		t.Fatal("client never received the TCP frame")
 	}
 }
+
+func TestPublicCandidatesPreferUDPAndThenAddressOrder(t *testing.T) {
+	got := publicCandidates(" 192.0.2.1, bad, 192.0.2.2, 192.0.2.1 ", 40401)
+	want := []string{
+		"a=candidate:7001 1 udp 2130680831 192.0.2.1 40401 typ host",
+		"a=candidate:7002 1 tcp 1671404543 192.0.2.1 40401 typ host tcptype passive",
+		"a=candidate:7003 1 udp 2130680575 192.0.2.2 40401 typ host",
+		"a=candidate:7004 1 tcp 1671404287 192.0.2.2 40401 typ host tcptype passive",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("candidate %d: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
