@@ -10,7 +10,7 @@ import (
 )
 
 func TestHandleStreamWritesFailureAckOnBlockedTCP(t *testing.T) {
-	ack := runBlockedRequest(t, ConnectRequest{Cmd: connectCommand, ClientID: "client-1", Addr: "198.18.0.10", Port: 443})
+	ack := runBlockedRequest(t, ConnectRequest{Cmd: connectCommand, ClientID: "client-1", Addr: "127.0.0.1", Port: 443})
 	if ack != 0x01 {
 		t.Fatalf("ack = %#x, want failure ack", ack)
 	}
@@ -66,6 +66,7 @@ func runBlockedRequest(t *testing.T, req ConnectRequest) byte {
 	if _, err := io.ReadFull(stream, ack); err != nil {
 		t.Fatalf("ReadFull(ack) error = %v", err)
 	}
+	_ = stream.Close()
 	<-done
 	return ack[0]
 }
