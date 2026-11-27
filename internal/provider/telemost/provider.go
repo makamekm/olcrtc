@@ -58,6 +58,9 @@ func (t *telemostProvider) WatchConnection(ctx context.Context) {
 	t.peer.WatchConnection(ctx)
 }
 
+// RequestReconnect asks the existing lifecycle loop to rejoin the conference.
+func (t *telemostProvider) RequestReconnect() bool { return t.peer.queueReconnect() }
+
 // CanSend checks if the provider is ready to transmit data.
 func (t *telemostProvider) CanSend() bool {
 	return t.peer.CanSend()

@@ -18,6 +18,11 @@ type ByteStream interface {
 	CanSend() bool
 }
 
+// ReconnectRequester is an optional capability for rejoining a stalled carrier.
+type ReconnectRequester interface {
+	RequestReconnect() bool
+}
+
 // VideoTrack is a carrier capability for bidirectional video transport.
 type VideoTrack interface {
 	Connect(ctx context.Context) error

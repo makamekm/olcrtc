@@ -159,6 +159,7 @@ type streamTransport struct {
 	lastStats           atomic.Int64
 	lastEpochReset      atomic.Int64
 	lastIngressAt       atomic.Int64
+	lastPayloadSendAt   atomic.Int64
 	conferenceIngressAt atomic.Int64
 	localReconnectAt    atomic.Int64
 	firstPeerAt         atomic.Int64
@@ -484,6 +485,7 @@ func (p *streamTransport) Send(data []byte) error {
 		return ErrTransportClosed
 	}
 
+	p.lastPayloadSendAt.Store(time.Now().UnixNano())
 	return rt.send(data)
 }
 
@@ -544,6 +546,11 @@ func (p *streamTransport) SetEndedCallback(cb func(string)) {
 }
 
 func (p *streamTransport) WatchConnection(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if requester, ok := p.stream.(carrier.ReconnectRequester); ok {
+		go p.watchCarrierIngress(ctx, requester)
+	}
 	p.stream.WatchConnection(ctx)
 }
 

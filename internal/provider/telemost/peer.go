@@ -173,16 +173,18 @@ func closeSignal(ch chan struct{}) {
 	}
 }
 
-func (p *Peer) queueReconnect() {
+func (p *Peer) queueReconnect() bool {
 	if p.closed.Load() || p.reconnecting.Load() {
-		return
+		return false
 	}
 	if p.shouldReconnect != nil && !p.shouldReconnect() {
-		return
+		return false
 	}
 	select {
 	case p.reconnectCh <- struct{}{}:
+		return true
 	default:
+		return false
 	}
 }
 

@@ -109,6 +109,11 @@ func (v *providerVideoTrack) WatchConnection(ctx context.Context) {
 }
 func (v *providerVideoTrack) CanSend() bool { return v.provider.CanSend() }
 
+func (v *providerVideoTrack) RequestReconnect() bool {
+	requester, ok := v.provider.(carrier.ReconnectRequester)
+	return ok && requester.RequestReconnect()
+}
+
 func (v *providerVideoTrack) AddTrack(track webrtc.TrackLocal) error {
 	if err := v.provider.AddVideoTrack(track); err != nil {
 		return fmt.Errorf("add track: %w", err)
