@@ -63,6 +63,14 @@ func (d *directLink) Send(data []byte) error {
 	return nil
 }
 
+// BindSender keeps a stream connection on the transport session it opened on.
+func (d *directLink) BindSender() func([]byte) error {
+	if binder, ok := d.transport.(interface{ BindSender() func([]byte) error }); ok {
+		return binder.BindSender()
+	}
+	return d.Send
+}
+
 func (d *directLink) Close() error {
 	if err := d.transport.Close(); err != nil {
 		return fmt.Errorf("transport close: %w", err)

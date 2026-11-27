@@ -49,18 +49,19 @@ var (
 
 // Client handles local SOCKS5 connections and tunnels them to the server.
 type Client struct {
-	ln              link.Link
-	cipher          *crypto.Cipher
-	conn            *muxconn.Conn
-	session         *smux.Session
-	sessMu          sync.RWMutex
-	reconnectMu     sync.Mutex
-	lastReconnectAt time.Time
-	clientID        string
-	dnsServer       string
-	socksUser       string
-	socksPass       string
-	keyInUse        atomic.Bool // the server serves another device with this key
+	ln             link.Link
+	cipher         *crypto.Cipher
+	conn           *muxconn.Conn
+	session        *smux.Session
+	sessMu         sync.RWMutex
+	reconnectMu    sync.Mutex
+	sessionChanged chan struct{}
+	shuttingDown   bool
+	clientID       string
+	dnsServer      string
+	socksUser      string
+	socksPass      string
+	keyInUse       atomic.Bool // the server serves another device with this key
 }
 
 // Run starts the client with the specified parameters.
@@ -190,14 +191,33 @@ func (c *Client) directPathLoop(ctx context.Context) {
 	if !ok {
 		return
 	}
-	wait := 3 * time.Second
+	const firstRetry = 3 * time.Second
+	wait := firstRetry
 	for {
+		c.sessMu.RLock()
+		sess, changed := c.session, c.sessionChanged
+		c.sessMu.RUnlock()
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-time.After(wait):
+		case <-changed:
+			timer.Stop()
+			wait = firstRetry
+			continue
+		case <-timer.C:
 		}
-		path, err := c.negotiateDirect(ctx)
+		path, err := c.negotiateDirect(ctx, sess)
+		select {
+		case <-changed:
+			if path != nil {
+				path.Close()
+			}
+			wait = firstRetry
+			continue
+		default:
+		}
 		switch {
 		case errors.Is(err, directpath.ErrUnsupported):
 			logger.Infof("direct path: not offered by server; staying on the conference path")
@@ -234,13 +254,19 @@ func (c *Client) directPathLoop(ctx context.Context) {
 	}
 }
 
-func (c *Client) negotiateDirect(ctx context.Context) (*directpath.Path, error) {
-	c.sessMu.RLock()
-	sess := c.session
-	c.sessMu.RUnlock()
+func (c *Client) negotiateDirect(ctx context.Context, sess *smux.Session) (*directpath.Path, error) {
 	if sess == nil || sess.IsClosed() {
 		return nil, errors.New("tunnel session not ready")
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-sess.CloseChan():
+			cancel()
+		}
+	}()
 	stream, err := sess.OpenStream()
 	if err != nil {
 		return nil, fmt.Errorf("open signalling stream: %w", err)
@@ -342,16 +368,15 @@ func (c *Client) bringUpLink(
 		return fmt.Errorf("failed to connect link: %w", err)
 	}
 
-	conn := muxconn.New(ln, c.cipher)
-	sess, err := smux.Client(conn, smuxConfig())
-	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("smux client: %w", err)
+	c.reconnectMu.Lock()
+	var sessionErr error
+	if c.session == nil {
+		sessionErr = c.installSession()
 	}
-	c.sessMu.Lock()
-	c.conn = conn
-	c.session = sess
-	c.sessMu.Unlock()
+	c.reconnectMu.Unlock()
+	if sessionErr != nil {
+		return sessionErr
+	}
 
 	go ln.WatchConnection(ctx)
 	return nil
@@ -370,50 +395,52 @@ func smuxConfig() *smux.Config {
 	return cfg
 }
 
-func (c *Client) handleReconnect() {
-	c.reconnectMu.Lock()
-	defer c.reconnectMu.Unlock()
-
-	now := time.Now()
-	if !c.lastReconnectAt.IsZero() && now.Sub(c.lastReconnectAt) < 2*time.Second {
-		logger.Debugf("client link reconnect ignored - debounce window")
-		return
-	}
-	c.lastReconnectAt = now
-
-	logger.Infof("client link reconnect - reinstalling smux session")
-	c.sessMu.Lock()
-	if c.session != nil {
-		_ = c.session.Close()
-		c.session = nil
-	}
-	if c.conn != nil {
-		_ = c.conn.Close()
-		c.conn = nil
-	}
-	c.sessMu.Unlock()
+// installSession is called with reconnectMu held.
+func (c *Client) installSession() error {
 	conn := muxconn.New(c.ln, c.cipher)
 	sess, err := smux.Client(conn, smuxConfig())
 	if err != nil {
 		_ = conn.Close()
-		logger.Warnf("smux re-init failed: %v", err)
-		return
+		return fmt.Errorf("smux client: %w", err)
 	}
-	c.sessMu.Lock()
-	c.conn = conn
-	c.session = sess
-	c.sessMu.Unlock()
-}
-
-func (c *Client) shutdown() {
 	c.sessMu.Lock()
 	if c.session != nil {
 		_ = c.session.Close()
 	}
-	if c.conn != nil {
+	c.conn = conn
+	c.session = sess
+	if c.sessionChanged != nil {
+		close(c.sessionChanged)
+	}
+	c.sessionChanged = make(chan struct{})
+	c.sessMu.Unlock()
+	return nil
+}
+
+func (c *Client) handleReconnect() {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+	if c.shuttingDown {
+		return
+	}
+
+	logger.Infof("client link reconnect - reinstalling smux session")
+	if err := c.installSession(); err != nil {
+		logger.Warnf("smux re-init failed: %v", err)
+	}
+}
+
+func (c *Client) shutdown() {
+	c.reconnectMu.Lock()
+	c.shuttingDown = true
+	c.sessMu.Lock()
+	if c.session != nil {
+		_ = c.session.Close()
+	} else if c.conn != nil {
 		_ = c.conn.Close()
 	}
 	c.sessMu.Unlock()
+	c.reconnectMu.Unlock()
 	if c.ln != nil {
 		_ = c.ln.Close()
 	}

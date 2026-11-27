@@ -513,3 +513,21 @@ func TestShutdownClosesLinkAndConn(t *testing.T) {
 		t.Fatal("shutdown() did not close link")
 	}
 }
+
+func TestBackToBackReconnectsBothReplaceSession(t *testing.T) {
+	c := &Client{ln: &closerLinkStub{}}
+	t.Cleanup(c.shutdown)
+	c.handleReconnect()
+	first := c.session
+	changed := c.sessionChanged
+
+	c.handleReconnect()
+	if c.session == nil || c.session == first || !first.IsClosed() {
+		t.Fatal("second reconnect must close and replace the previous session")
+	}
+	select {
+	case <-changed:
+	default:
+		t.Fatal("direct negotiation was not notified of the session change")
+	}
+}

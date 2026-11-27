@@ -34,6 +34,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/directpath"
 	kcp "github.com/xtaci/kcp-go/v5"
 	"hash/fnv"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -140,7 +141,6 @@ type streamTransport struct {
 	closed              atomic.Bool
 	writerUp            atomic.Bool
 	writerOnce          sync.Once
-	kcpOnce             sync.Once
 	frameInterval       time.Duration
 	batchSize           int
 	maxSampleBytes      int
@@ -202,10 +202,12 @@ type streamTransport struct {
 	// current one; feeding both epochs into one KCP runtime corrupts its state.
 	initialPeerPromoted atomic.Bool
 
-	kcp         *kcpRuntime
-	kcpMu       sync.RWMutex
-	reconnectMu sync.Mutex
-	reconnectFn func()
+	ingressMu     sync.Mutex // serializes received frames with local session changes
+	kcp           *kcpRuntime
+	kcpMu         sync.RWMutex
+	kcpGeneration uint64
+	reconnectMu   sync.Mutex
+	reconnectFn   func()
 }
 
 // New creates a vp8channel transport backed by a carrier.
@@ -474,17 +476,33 @@ func (p *streamTransport) SetBusyCallback(cb func()) {
 }
 
 func (p *streamTransport) Send(data []byte) error {
-	if p.closed.Load() {
-		return ErrTransportClosed
-	}
-
 	p.kcpMu.RLock()
 	rt := p.kcp
 	p.kcpMu.RUnlock()
-	if rt == nil {
+	return p.send(rt, data)
+}
+
+// BindSender prevents an old smux writer from using a replacement KCP session.
+func (p *streamTransport) BindSender() func([]byte) error {
+	p.kcpMu.RLock()
+	generation := p.kcpGeneration
+	p.kcpMu.RUnlock()
+	return func(data []byte) error {
+		p.kcpMu.RLock()
+		rt := p.kcp
+		current := p.kcpGeneration == generation
+		p.kcpMu.RUnlock()
+		if !current {
+			return io.ErrClosedPipe
+		}
+		return p.send(rt, data)
+	}
+}
+
+func (p *streamTransport) send(rt *kcpRuntime, data []byte) error {
+	if rt == nil || p.closed.Load() {
 		return ErrTransportClosed
 	}
-
 	p.lastPayloadSendAt.Store(time.Now().UnixNano())
 	return rt.send(data)
 }
@@ -528,12 +546,10 @@ func (p *streamTransport) SetReconnectCallback(cb func()) {
 	p.reconnectFn = cb
 	p.reconnectMu.Unlock()
 	p.stream.SetReconnectCallback(func() {
+		p.ingressMu.Lock()
+		defer p.ingressMu.Unlock()
 		p.localReconnectAt.Store(time.Now().UnixNano())
-		p.startNewLocalSession()
-		p.resetKCP()
-		if cb != nil {
-			cb()
-		}
+		p.resetKCP(p.startNewLocalSession)
 	})
 }
 
@@ -825,24 +841,6 @@ func (p *streamTransport) buildSample(frames [][]byte) []byte {
 	return sample
 }
 
-// resetForNewPeerSession replaces KCP after the peer started a new session
-// and makes the upper layer reinstall its smux session before any frame of
-// the new session is delivered. KCP alone is not enough: the old smux
-// session keeps the previous peer's stream IDs and flow-control state, so
-// the new peer's streams were accepted but never answered (every Wi-Fi/LTE
-// switch wedged the tunnel until a full restart). Runs synchronously on the
-// ingress goroutine on purpose: data delivered into the old smux session
-// before the swap would be acknowledged by KCP and lost.
-func (p *streamTransport) resetForNewPeerSession() {
-	p.resetKCP()
-	p.reconnectMu.Lock()
-	cb := p.reconnectFn
-	p.reconnectMu.Unlock()
-	if cb != nil {
-		cb()
-	}
-}
-
 func (p *streamTransport) newKCP() (*kcpRuntime, error) {
 	rt, err := startKCP(p.outbound, p.onData, p.epochHeader())
 	if err != nil {
@@ -922,29 +920,49 @@ func (p *streamTransport) startNewLocalSession() {
 	logger.Infof("vp8channel: local carrier reconnected; new local session epoch prev=0x%08x next=0x%08x", prev, next)
 }
 
-func (p *streamTransport) resetKCP() {
-	p.kcpMu.Lock()
-	old := p.kcp
-	p.kcp = nil
-	p.kcpMu.Unlock()
-	if old != nil {
-		old.close()
-	}
-	// Drain after closing so the old session cannot queue more packets that
-	// would go out stamped for the new peer session.
-	p.drainOutbound()
-	// Note: localEpoch is intentionally NOT bumped here. The epoch is a
-	// per-process identifier set once in New(). If we changed it on every
-	// peer-triggered reset, the peer would see a "new" epoch from us, reset
-	// itself, send back its (unchanged) epoch which we'd then see as "new"
-	// again - and the two sides would loop forever tearing down smux.
-	rt, err := p.newKCP()
-	if err != nil {
+// resetKCP runs under ingressMu. Keep sending disabled until smux has
+// dropped the old stream IDs and bound its replacement to the new generation.
+func (p *streamTransport) resetKCP(changeEpoch func()) {
+	if p.closed.Load() {
 		return
 	}
 	p.kcpMu.Lock()
-	p.kcp = rt
+	old := p.kcp
+	p.kcp = nil
+	p.kcpGeneration++
 	p.kcpMu.Unlock()
+	if old != nil {
+		old.close()
+		// Any data already read by the retired runtime belongs to the old smux.
+		<-old.readDone
+	}
+	p.drainOutbound()
+	if changeEpoch != nil {
+		changeEpoch()
+	}
+
+	p.reconnectMu.Lock()
+	cb := p.reconnectFn
+	p.reconnectMu.Unlock()
+	if cb != nil {
+		cb()
+	}
+	p.installKCP()
+}
+
+func (p *streamTransport) installKCP() {
+	p.kcpMu.Lock()
+	defer p.kcpMu.Unlock()
+	if p.closed.Load() || p.kcp != nil {
+		return
+	}
+	rt, err := p.newKCP()
+	if err != nil {
+		logger.Infof("vp8channel: startKCP failed: %v", err)
+		return
+	}
+	p.kcp = rt
+	logger.Infof("vp8channel: KCP started localEpoch=0x%08x", p.localEpoch.Load())
 }
 
 func (p *streamTransport) handleRemoteTrack(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -1058,23 +1076,15 @@ func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
 	p.peerEpoch.Store(peerEpoch)
 	p.firstPeerAt.Store(time.Now().UnixNano())
 	logger.Infof("vp8channel: peer first seen epoch=0x%08x", peerEpoch)
-	p.kcpOnce.Do(func() {
-		rt, err := p.newKCP()
-		if err != nil {
-			logger.Infof("vp8channel: startKCP failed: %v", err)
-			return
-		}
-		p.kcpMu.Lock()
-		p.kcp = rt
-		p.kcpMu.Unlock()
-		logger.Infof("vp8channel: KCP started localEpoch=0x%08x", p.localEpoch.Load())
-	})
+	p.installKCP()
 }
 
 // handleIncomingFrame parses the epoch header and either delivers the KCP
 // payload to the local session or triggers a reset when the peer's epoch
 // changes (peer process restart).
 func (p *streamTransport) handleIncomingFrame(frame []byte) bool {
+	p.ingressMu.Lock()
+	defer p.ingressMu.Unlock()
 	frameToken := binary.BigEndian.Uint32(frame[tokenOff:epochOff])
 	expectedToken := p.expectedPeerBindingToken()
 	isDirectional := frameToken == expectedToken
@@ -1099,7 +1109,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) bool {
 		p.retiredPeerEpochs.Store(prev, struct{}{})
 		p.lastEpochReset.Store(time.Now().UnixNano())
 		logger.Infof("vp8channel: peer upgraded from legacy to directional token prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
-		p.resetKCP()
+		p.resetKCP(nil)
 	}
 	// Some carriers/SFUs reflect our own published VP8 track back to us as a
 	// remote track. Those frames carry our local epoch, not the peer's. If we
@@ -1127,7 +1137,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) bool {
 					peerEpoch,
 				)
 				p.lastEpochReset.Store(now)
-				p.resetKCP()
+				p.resetKCP(nil)
 			} else {
 				// Once the current SFU track has been promoted, frames from the
 				// previously selected stale epoch must not enter the new KCP runtime.
@@ -1139,7 +1149,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) bool {
 			if p.promotePeerEpoch(prev, peerEpoch) {
 				logger.Infof("vp8channel: peer epoch accepted after local reconnect prev=0x%08x next=0x%08x - keeping fresh KCP", prev, peerEpoch)
 			}
-		} else if hadIngress := p.inFrames.Load() > 0; p.peerIngressIdle(now) {
+		} else if p.peerIngressIdle(now) {
 			// A long-lived server peer can retain a stale client track after Stop.
 			// When the next client process joins with a new epoch, keeping the old
 			// KCP runtime makes the handshake permanently incompatible. Promote only
@@ -1148,11 +1158,7 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) bool {
 			if p.promotePeerEpoch(prev, peerEpoch) {
 				logger.Infof("vp8channel: peer epoch promoted after ingress idle prev=0x%08x next=0x%08x - resetting KCP", prev, peerEpoch)
 				p.lastEpochReset.Store(now)
-				if hadIngress {
-					p.resetForNewPeerSession()
-				} else {
-					p.resetKCP()
-				}
+				p.resetKCP(nil)
 			}
 		} else {
 			return false

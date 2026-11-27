@@ -43,20 +43,19 @@ var (
 
 // Server handles incoming tunnel connections and proxies their traffic.
 type Server struct {
-	ln              link.Link
-	cipher          *crypto.Cipher
-	conn            *muxconn.Conn
-	session         *smux.Session
-	sessMu          sync.RWMutex
-	reinstallMu     sync.Mutex
-	reconnectMu     sync.Mutex
-	lastReconnectAt time.Time
-	wg              sync.WaitGroup
-	clientID        string
-	dnsServer       string
-	resolver        *net.Resolver
-	socksProxyAddr  string
-	socksProxyPort  int
+	ln             link.Link
+	cipher         *crypto.Cipher
+	conn           *muxconn.Conn
+	session        *smux.Session
+	sessMu         sync.RWMutex
+	reinstallMu    sync.Mutex
+	reconnectMu    sync.Mutex
+	wg             sync.WaitGroup
+	clientID       string
+	dnsServer      string
+	resolver       *net.Resolver
+	socksProxyAddr string
+	socksProxyPort int
 	// direct accepts peer-to-peer data channels (nil when disabled).
 	direct      *directpath.Server
 	directRetry directRetryState
@@ -249,7 +248,7 @@ func (s *Server) bringUpLink(
 	}
 	logger.Infof("Link connected")
 
-	s.installSession()
+	s.reinstallSession(nil)
 
 	s.wg.Add(1)
 	go func() {
@@ -275,13 +274,6 @@ func (s *Server) installSession() {
 func (s *Server) handleReconnect() {
 	s.reconnectMu.Lock()
 	defer s.reconnectMu.Unlock()
-
-	now := time.Now()
-	if !s.lastReconnectAt.IsZero() && now.Sub(s.lastReconnectAt) < 2*time.Second {
-		logger.Debugf("server link reconnect ignored - debounce window")
-		return
-	}
-	s.lastReconnectAt = now
 
 	logger.Infof("server link reconnect - reinstalling smux session")
 	s.sessMu.RLock()

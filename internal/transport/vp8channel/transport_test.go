@@ -227,8 +227,8 @@ func TestZeroIngressEpochChangePromotesPeerAndResetsKCP(t *testing.T) {
 	if got := tr.lastEpochReset.Load(); got == 0 {
 		t.Fatal("lastEpochReset was not recorded during zero-ingress promotion")
 	}
-	if got := called.Load(); got != 0 {
-		t.Fatalf("reconnect called during zero ingress: got %d want 0", got)
+	if got := called.Load(); got != 1 {
+		t.Fatalf("smux must be renewed with KCP during zero ingress: got %d want 1", got)
 	}
 	tr.kcpMu.RLock()
 	newKCP := tr.kcp

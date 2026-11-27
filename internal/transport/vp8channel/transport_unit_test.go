@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -341,9 +342,10 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	}
 	reconnected = false
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 2, nil))
-	if reconnected || tr.peerEpoch.Load() != 2 {
-		t.Fatalf("initial epoch switch should adopt without reconnect: reconnected=%v epoch=%d", reconnected, tr.peerEpoch.Load()) //nolint:lll // long test description
+	if !reconnected || tr.peerEpoch.Load() != 2 {
+		t.Fatalf("initial epoch switch should also renew smux: reconnected=%v epoch=%d", reconnected, tr.peerEpoch.Load()) //nolint:lll // long test description
 	}
+	reconnected = false
 	tr.firstPeerAt.Store(time.Now().Add(-11 * time.Second).UnixNano())
 	beforeKCP := tr.kcp
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 3, []byte("after-local-reconnect")))
@@ -355,8 +357,8 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	tr.inFrames.Store(0)
 	beforeKCP = tr.kcp
 	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 4, []byte("zero-ingress-remote-restart")))
-	if reconnected || tr.peerEpoch.Load() != 4 || tr.kcp == beforeKCP {
-		t.Fatalf("zero-ingress epoch change should adopt with KCP reset: reconnected=%v epoch=%d kcp=%v before=%v", reconnected, tr.peerEpoch.Load(), tr.kcp, beforeKCP) //nolint:lll // long test description
+	if !reconnected || tr.peerEpoch.Load() != 4 || tr.kcp == beforeKCP {
+		t.Fatalf("zero-ingress epoch change should renew KCP and smux: reconnected=%v epoch=%d kcp=%v before=%v", reconnected, tr.peerEpoch.Load(), tr.kcp, beforeKCP) //nolint:lll // long test description
 	}
 
 	reconnected = false
@@ -383,5 +385,38 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	// too; with only KCP reset its new streams were accepted but never answered.
 	if !reconnected || tr.peerEpoch.Load() != 6 || tr.kcp == nil || tr.kcp == beforeKCP {
 		t.Fatalf("frozen ingress epoch change should be adopted with KCP and session reset: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+	}
+}
+
+func TestCarrierReconnectRebindsSenderBeforePublishingKCP(t *testing.T) {
+	tr := &streamTransport{
+		stream:   &fakeVideoStream{},
+		outbound: make(chan []byte, 16),
+		closeCh:  make(chan struct{}),
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+	tr.setLocalEpoch(100)
+	tr.handleFirstPeer(200)
+	oldSend := tr.BindSender()
+	if err := oldSend([]byte("before reconnect")); err != nil {
+		t.Fatalf("old sender before reconnect: %v", err)
+	}
+
+	var newSend func([]byte) error
+	tr.SetReconnectCallback(func() {
+		if tr.CanSend() {
+			t.Error("KCP became writable before smux was replaced")
+		}
+		newSend = tr.BindSender()
+	})
+	tr.stream.(*fakeVideoStream).reconnect()
+	if newSend == nil {
+		t.Fatal("carrier reconnect did not renew smux")
+	}
+	if err := oldSend([]byte("stale smux write")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("old sender after reconnect: got %v, want closed pipe", err)
+	}
+	if err := newSend([]byte("new smux write")); err != nil {
+		t.Fatalf("new sender after reconnect: %v", err)
 	}
 }
