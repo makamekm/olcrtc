@@ -196,3 +196,63 @@ func TestPublicCandidatesPreferUDPAndThenAddressOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestDirectPathUsesReachableFallbackAddress(t *testing.T) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reachable string
+	for _, addr := range addrs {
+		if network, ok := addr.(*net.IPNet); ok && network.IP.To4() != nil && !network.IP.IsLoopback() {
+			reachable = network.IP.String()
+			break
+		}
+	}
+	if reachable == "" {
+		t.Skip("no non-loopback IPv4 address")
+	}
+
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	engine := webrtc.SettingEngine{}
+	engine.SetICEUDPMux(webrtc.NewICEUDPMux(nil, listener))
+	engine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+	server := &Server{
+		api:      webrtc.NewAPI(webrtc.WithSettingEngine(engine)),
+		port:     listener.LocalAddr().(*net.UDPAddr).Port,
+		publicIP: "192.0.2.1," + reachable,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	offerer, offer, err := NewOfferer(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer offerer.Abort()
+	serverPath, answer, err := server.Answer(ctx, offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverPath.Close()
+
+	var lines []string
+	for _, line := range strings.Split(answer, "\r\n") {
+		if !strings.HasPrefix(line, "a=candidate:") || strings.HasPrefix(line, "a=candidate:7001 ") || strings.HasPrefix(line, "a=candidate:7003 ") {
+			lines = append(lines, line)
+		}
+	}
+	path, err := offerer.Finish(ctx, strings.Join(lines, "\r\n"))
+	if err != nil {
+		t.Fatalf("could not connect through the second address: %v", err)
+	}
+	defer path.Close()
+	pair, err := offerer.pc.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
+	if err != nil || pair == nil || pair.Remote.Address != reachable {
+		t.Fatalf("selected pair = %v, error = %v, want second address %s", pair, err, reachable)
+	}
+}
