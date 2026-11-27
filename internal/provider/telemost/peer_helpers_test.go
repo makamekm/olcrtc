@@ -109,7 +109,7 @@ func TestConferenceEndParsing(t *testing.T) {
 //nolint:cyclop // table-driven test naturally has many branches
 func TestPeerSmallStateHelpers(t *testing.T) {
 	p := &Peer{
-		reconnectCh: make(chan struct{}, 1),
+		reconnectCh: make(chan bool, 1),
 		closeCh:     make(chan struct{}),
 		sendQueue:   make(chan []byte, 2),
 		ackWaiters:  make(map[string]chan struct{}),
@@ -167,10 +167,10 @@ func TestPeerSmallStateHelpers(t *testing.T) {
 
 func TestTelemostPeerEventParsing(t *testing.T) {
 	cases := []struct {
-		name  string
-		msg   map[string]interface{}
-		want  string
-		ok    bool
+		name string
+		msg  map[string]interface{}
+		want string
+		ok   bool
 	}{
 		{
 			name: "joined message",

@@ -18,7 +18,7 @@ type ByteStream interface {
 	CanSend() bool
 }
 
-// ReconnectRequester is an optional capability for rejoining a stalled carrier.
+// ReconnectRequester can rejoin the carrier while keeping the tunnel session.
 type ReconnectRequester interface {
 	RequestReconnect() bool
 }

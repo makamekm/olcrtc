@@ -76,7 +76,7 @@ type Peer struct {
 	onData              func([]byte)
 	onReconnect         func(*webrtc.DataChannel)
 	shouldReconnect     func() bool
-	reconnectCh         chan struct{}
+	reconnectCh         chan bool
 	closeCh             chan struct{}
 	keepAliveCh         chan struct{}
 	telemetryCh         chan struct{}
@@ -145,7 +145,7 @@ func NewPeer(ctx context.Context, roomURL, name string, onData func([]byte)) (*P
 		name:           name,
 		conn:           conn,
 		onData:         onData,
-		reconnectCh:    make(chan struct{}, 1),
+		reconnectCh:    make(chan bool, 1),
 		closeCh:        make(chan struct{}),
 		keepAliveCh:    make(chan struct{}),
 		sessionCloseCh: make(chan struct{}),
@@ -173,7 +173,13 @@ func closeSignal(ch chan struct{}) {
 	}
 }
 
-func (p *Peer) queueReconnect() bool {
+func (p *Peer) queueReconnect() {
+	p.enqueueReconnect(false)
+}
+
+// keepTunnel preserves higher-level state for a media rejoin where the
+// logical peer may still be present at the same transport epoch.
+func (p *Peer) enqueueReconnect(keepTunnel bool) bool {
 	if p.closed.Load() || p.reconnecting.Load() {
 		return false
 	}
@@ -181,7 +187,7 @@ func (p *Peer) queueReconnect() bool {
 		return false
 	}
 	select {
-	case p.reconnectCh <- struct{}{}:
+	case p.reconnectCh <- keepTunnel:
 		return true
 	default:
 		return false
@@ -1367,7 +1373,7 @@ func (p *Peer) sendAppPing() bool {
 	return true
 }
 
-func (p *Peer) reconnect(ctx context.Context) error {
+func (p *Peer) reconnect(ctx context.Context, keepTunnel bool) error {
 	p.reconnecting.Store(true)
 	defer p.reconnecting.Store(false)
 
@@ -1404,7 +1410,9 @@ func (p *Peer) reconnect(ctx context.Context) error {
 		return err
 	}
 
-	if p.onReconnect != nil {
+	if keepTunnel {
+		logger.Infof("telemost: conference rejoined; preserving tunnel session")
+	} else if p.onReconnect != nil {
 		p.onReconnect(p.dc)
 	}
 	p.drainReconnectQueue()
@@ -1432,15 +1440,15 @@ func (p *Peer) WatchConnection(ctx context.Context) {
 			return
 		case <-p.closeCh:
 			return
-		case <-p.reconnectCh:
-			if p.handleReconnectAttempt(ctx, maxReconnects, reconnectWindow) {
+		case keepTunnel := <-p.reconnectCh:
+			if p.handleReconnectAttempt(ctx, maxReconnects, reconnectWindow, keepTunnel) {
 				return
 			}
 		}
 	}
 }
 
-func (p *Peer) handleReconnectAttempt(ctx context.Context, maxReconnects int, reconnectWindow time.Duration) bool {
+func (p *Peer) handleReconnectAttempt(ctx context.Context, maxReconnects int, reconnectWindow time.Duration, keepTunnel bool) bool {
 	if time.Since(p.lastReconnect) > reconnectWindow {
 		p.reconnectCount = 0
 	}
@@ -1457,12 +1465,12 @@ func (p *Peer) handleReconnectAttempt(ctx context.Context, maxReconnects int, re
 		backoff = 30 * time.Second
 	}
 
-	return p.retryReconnect(ctx, backoff)
+	return p.retryReconnect(ctx, backoff, keepTunnel)
 }
 
-func (p *Peer) retryReconnect(ctx context.Context, backoff time.Duration) bool {
+func (p *Peer) retryReconnect(ctx context.Context, backoff time.Duration, keepTunnel bool) bool {
 	for {
-		if err := p.reconnect(ctx); err != nil {
+		if err := p.reconnect(ctx, keepTunnel); err != nil {
 			logger.Debugf("reconnect failed: %v", err)
 			select {
 			case <-ctx.Done():

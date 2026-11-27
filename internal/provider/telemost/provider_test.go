@@ -11,7 +11,7 @@ import (
 //nolint:cyclop // table-driven test naturally has many branches
 func TestTelemostProviderForwardsPeerMethods(t *testing.T) {
 	peer := &Peer{
-		reconnectCh: make(chan struct{}, 1),
+		reconnectCh: make(chan bool, 1),
 		closeCh:     make(chan struct{}),
 		sendQueue:   make(chan []byte, 1),
 		ackWaiters:  make(map[string]chan struct{}),
@@ -51,5 +51,15 @@ func TestTelemostProviderForwardsPeerMethods(t *testing.T) {
 
 	if err := p.Send([]byte("x")); !errors.Is(err, ErrDataChannelNotReady) {
 		t.Fatalf("Send() error = %v, want datachannel not ready", err)
+	}
+}
+
+func TestRequestReconnectKeepsTunnelSession(t *testing.T) {
+	p := &telemostProvider{peer: &Peer{reconnectCh: make(chan bool, 1)}}
+	if !p.RequestReconnect() {
+		t.Fatal("media rejoin was not enqueued")
+	}
+	if !<-p.peer.reconnectCh {
+		t.Fatal("media rejoin would reset the tunnel session")
 	}
 }

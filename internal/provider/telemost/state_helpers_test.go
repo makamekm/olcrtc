@@ -8,7 +8,7 @@ import (
 //nolint:cyclop // table-driven test naturally has many branches
 func TestSessionReconnectAndEndedHelpers(t *testing.T) {
 	p := &Peer{
-		reconnectCh:    make(chan struct{}, 2),
+		reconnectCh:    make(chan bool, 2),
 		closeCh:        make(chan struct{}),
 		keepAliveCh:    make(chan struct{}),
 		sessionCloseCh: make(chan struct{}),
@@ -42,8 +42,8 @@ func TestSessionReconnectAndEndedHelpers(t *testing.T) {
 	default:
 	}
 
-	p.reconnectCh <- struct{}{}
-	p.reconnectCh <- struct{}{}
+	p.reconnectCh <- false
+	p.reconnectCh <- false
 	p.drainReconnectQueue()
 	select {
 	case <-p.reconnectCh:
