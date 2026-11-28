@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -61,5 +62,18 @@ func TestRequestReconnectKeepsTunnelSession(t *testing.T) {
 	}
 	if !<-p.peer.reconnectCh {
 		t.Fatal("media rejoin would reset the tunnel session")
+	}
+}
+
+func TestMediaRejoinDoesNotSpendSessionResetBudget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	now := time.Now()
+	p := &Peer{lastReconnect: now, reconnectCount: 10}
+	if !p.handleReconnectAttempt(ctx, 10, 5*time.Minute, true) {
+		t.Fatal("media rejoin did not stop after cancellation")
+	}
+	if p.reconnectCount != 10 || !p.lastReconnect.Equal(now) {
+		t.Fatal("media rejoin modified the session reset budget")
 	}
 }

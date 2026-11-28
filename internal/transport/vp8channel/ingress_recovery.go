@@ -31,12 +31,19 @@ func (p *streamTransport) watchCarrierIngress(ctx context.Context, requester car
 			if now.Sub(lastAttempt) < ingressRecoveryCooldown {
 				continue
 			}
-			lastIngress := p.lastIngressAt.Load()
-			if carrierIngressStalled(now, lastIngress, p.lastPayloadSendAt.Load(), p.DirectPathActive()) {
-				lastAttempt = now
-				if requester.RequestReconnect() {
-					logger.Infof("vp8channel: both paths stopped delivering ingress; rejoining conference")
-				}
+			blockedSince := p.carrierBlockedSince.Load()
+			if blockedSince != 0 && p.sendPathReady() {
+				p.carrierBlockedSince.CompareAndSwap(blockedSince, 0)
+				blockedSince = 0
+			}
+			writeBlocked := blockedSince != 0 && now.Sub(time.Unix(0, blockedSince)) >= ingressRecoveryDelay
+			ingressStalled := carrierIngressStalled(now, p.lastIngressAt.Load(), p.lastPayloadSendAt.Load(), p.DirectPathActive())
+			if !writeBlocked && !ingressStalled {
+				continue
+			}
+			lastAttempt = now
+			if requester.RequestReconnect() {
+				logger.Infof("vp8channel: rejoining conference (send blocked=%t, ingress stalled=%t)", writeBlocked, ingressStalled)
 			}
 		}
 	}

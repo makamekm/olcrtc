@@ -66,3 +66,43 @@ func TestWatchCarrierIngressRequestsRejoinWhenFramesStop(t *testing.T) {
 		t.Fatal("ingress watcher did not stop")
 	}
 }
+
+func TestWatchCarrierIngressRejoinsWhenWritesCannotReachKCP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := &streamTransport{
+		stream:   &fakeVideoStream{},
+		closeCh:  make(chan struct{}),
+		outbound: make(chan []byte, 8),
+		kcp:      &kcpRuntime{},
+	}
+	if p.CanSend() || p.carrierBlockedSince.Load() == 0 {
+		t.Fatal("unavailable send paths did not record blocked writer")
+	}
+	p.carrierBlockedSince.Store(time.Now().Add(-ingressRecoveryDelay).UnixNano())
+	// Receiving idle frames cannot make a blocked outbound path writable.
+	p.lastIngressAt.Store(time.Now().UnixNano())
+	requested := make(recordedReconnect, 1)
+	go p.watchCarrierIngress(ctx, requested)
+	select {
+	case <-requested:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked writer did not request an in-process media rejoin")
+	}
+}
+
+func TestCanSendClearsCarrierBlockWhenPublisherReturns(t *testing.T) {
+	stream := &fakeVideoStream{}
+	p := &streamTransport{
+		stream:   stream,
+		outbound: make(chan []byte, 8),
+		kcp:      &kcpRuntime{},
+	}
+	if p.CanSend() || p.carrierBlockedSince.Load() == 0 {
+		t.Fatal("unavailable send paths did not record blocked writer")
+	}
+	stream.canSend = true
+	if !p.CanSend() || p.carrierBlockedSince.Load() != 0 {
+		t.Fatal("a healthy carrier did not clear the write block")
+	}
+}

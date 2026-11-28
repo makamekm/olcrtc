@@ -160,6 +160,7 @@ type streamTransport struct {
 	lastEpochReset      atomic.Int64
 	lastIngressAt       atomic.Int64
 	lastPayloadSendAt   atomic.Int64
+	carrierBlockedSince atomic.Int64
 	conferenceIngressAt atomic.Int64
 	localReconnectAt    atomic.Int64
 	firstPeerAt         atomic.Int64
@@ -577,8 +578,33 @@ func (p *streamTransport) CanSend() bool {
 	p.kcpMu.RLock()
 	hasKCP := p.kcp != nil
 	p.kcpMu.RUnlock()
-	return hasKCP && p.stream.CanSend() &&
-		len(p.outbound) < cap(p.outbound)*canSendHighWatermark/100
+	if !hasKCP {
+		return false
+	}
+	if !p.sendPathReady() {
+		if p.carrierBlockedSince.Load() == 0 {
+			p.carrierBlockedSince.CompareAndSwap(0, time.Now().UnixNano())
+		}
+		return false
+	}
+	if p.carrierBlockedSince.Load() != 0 {
+		p.carrierBlockedSince.Store(0)
+	}
+	return len(p.outbound) < cap(p.outbound)*canSendHighWatermark/100
+}
+
+func (p *streamTransport) directSendPath() *directpath.Path {
+	path := p.direct.Load()
+	if path == nil || p.conferenceProbePath.Load() == path || !path.Healthy() {
+		return nil
+	}
+	return path
+}
+
+// The media carrier can lose publisher readiness while the independent
+// direct data channel is still carrying KCP. Either path can admit writes.
+func (p *streamTransport) sendPathReady() bool {
+	return p.directSendPath() != nil || p.stream.CanSend()
 }
 
 // Features advertises reliable+ordered semantics now that KCP guarantees
@@ -876,8 +902,8 @@ func (p *streamTransport) AttachDirectPath(path *directpath.Path) {
 func (p *streamTransport) DirectPathActive() bool { return p.direct.Load().Healthy() }
 
 func (p *streamTransport) trySendDirect(frame []byte) bool {
-	path := p.direct.Load()
-	if path == nil || p.conferenceProbePath.Load() == path || !path.Healthy() {
+	path := p.directSendPath()
+	if path == nil {
 		return false
 	}
 	if p.serverRole {

@@ -1449,6 +1449,12 @@ func (p *Peer) WatchConnection(ctx context.Context) {
 }
 
 func (p *Peer) handleReconnectAttempt(ctx context.Context, maxReconnects int, reconnectWindow time.Duration, keepTunnel bool) bool {
+	// Rejoining the media carrier preserves the existing tunnel. A long-lived
+	// client can do this many times without exhausting its session reset budget.
+	if keepTunnel {
+		return p.retryReconnect(ctx, 5*time.Second, true)
+	}
+
 	if time.Since(p.lastReconnect) > reconnectWindow {
 		p.reconnectCount = 0
 	}
@@ -1465,11 +1471,18 @@ func (p *Peer) handleReconnectAttempt(ctx context.Context, maxReconnects int, re
 		backoff = 30 * time.Second
 	}
 
-	return p.retryReconnect(ctx, backoff, keepTunnel)
+	return p.retryReconnect(ctx, backoff, false)
 }
 
 func (p *Peer) retryReconnect(ctx context.Context, backoff time.Duration, keepTunnel bool) bool {
 	for {
+		select {
+		case <-ctx.Done():
+			return true
+		case <-p.closeCh:
+			return true
+		default:
+		}
 		if err := p.reconnect(ctx, keepTunnel); err != nil {
 			logger.Debugf("reconnect failed: %v", err)
 			select {
